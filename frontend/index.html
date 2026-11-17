@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Moscovo</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="hub-bar">
+      <div class="hub-summary" id="hub-summary" title="Click or press / to edit Hub and nickname">
+        <span class="status-dot" id="status-dot">●</span>
+        <span class="hub-label" id="hub-addr-display">hub: 127.0.0.1:7878</span>
+      </div>
+      <span class="status-badge" id="status-badge">[OFFLINE]</span>
+    </header>
+
+    <form class="hub-editor hidden" id="hub-editor">
+      <label class="field">
+        <span>HUB</span>
+        <input id="hub-input" type="text" autocomplete="off" spellcheck="false" placeholder="100.64.10.1:7878" />
+      </label>
+      <label class="field">
+        <span>NICK</span>
+        <input id="nick-input" type="text" autocomplete="off" spellcheck="false" placeholder="nickname" />
+      </label>
+      <div class="editor-actions">
+        <button type="submit" class="btn btn-primary">[ENTER] APPLY</button>
+        <button type="button" class="btn" id="cancel-edit-btn">[ESC] CANCEL</button>
+      </div>
+    </form>
+
+    <div class="error-banner hidden" id="error-banner" role="alert"></div>
+
+    <section class="device-bar" aria-label="Audio Devices">
+      <div class="device-item" id="mic-device-row" title="Active Microphone">
+        <span class="device-tag">IN</span>
+        <span class="device-name" id="mic-device-name">Default Microphone</span>
+      </div>
+      <div class="device-item" id="out-device-row" title="Active Output Audio">
+        <span class="device-tag">OUT</span>
+        <span class="device-name" id="out-device-name">Default Output</span>
+      </div>
+    </section>
+
+    <section class="room-section" aria-label="Voice Room">
+      <div class="section-title">
+        <span>VOICE ROOM</span>
+        <span id="room-meta"></span>
+      </div>
+      <div class="peer-list" id="peer-list"></div>
+    </section>
+
+    <footer class="controls">
+      <div class="action-row">
+        <button type="button" class="btn btn-primary" id="call-btn">[ENTER] JOIN</button>
+        <button type="button" class="btn" id="mute-btn">[M] MIC: ON</button>
+        <button type="button" class="btn" id="deafen-btn">[D] DEAFEN</button>
+      </div>
+      <div class="hint-row">
+        Space PTT · j/k select · h/l vol · x mute · / hub · Esc leave
+      </div>
+    </footer>
+  </main>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
