@@ -110,3 +110,41 @@ func (p *PeerSession) SetVolume(volume int) error {
 	p.Volume = volume
 	return nil
 }
+
+// NoiseSuppressionMode selects the client-side microphone noise suppressor algorithm.
+type NoiseSuppressionMode string
+
+const (
+	NoiseSuppressionOff     NoiseSuppressionMode = "off"
+	NoiseSuppressionRNNoise NoiseSuppressionMode = "rnnoise"
+	NoiseSuppressionSpeex   NoiseSuppressionMode = "speex"
+	NoiseSuppressionGate    NoiseSuppressionMode = "gate"
+
+	DefaultNoiseSuppressionMode = NoiseSuppressionRNNoise
+)
+
+// IsValidNoiseSuppressionMode reports whether m is a supported noise suppression mode.
+func IsValidNoiseSuppressionMode(m NoiseSuppressionMode) bool {
+	switch m {
+	case NoiseSuppressionOff, NoiseSuppressionRNNoise, NoiseSuppressionSpeex, NoiseSuppressionGate:
+		return true
+	default:
+		return false
+	}
+}
+
+// NextNoiseSuppressionMode returns the next mode in the cycle: off -> rnnoise -> speex -> gate -> off.
+func NextNoiseSuppressionMode(current NoiseSuppressionMode) NoiseSuppressionMode {
+	switch current {
+	case NoiseSuppressionOff:
+		return NoiseSuppressionRNNoise
+	case NoiseSuppressionRNNoise:
+		return NoiseSuppressionSpeex
+	case NoiseSuppressionSpeex:
+		return NoiseSuppressionGate
+	case NoiseSuppressionGate:
+		return NoiseSuppressionOff
+	default:
+		return DefaultNoiseSuppressionMode
+	}
+}

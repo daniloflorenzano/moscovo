@@ -44,8 +44,13 @@ func main() {
 			Handler: application.AssetFileServerFS(frontend.Assets),
 			Middleware: func(next http.Handler) http.Handler {
 				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if strings.HasSuffix(r.URL.Path, ".ts") {
+					switch {
+					case strings.HasSuffix(r.URL.Path, ".ts"),
+						strings.HasSuffix(r.URL.Path, ".js"),
+						strings.HasSuffix(r.URL.Path, ".mjs"):
 						w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+					case strings.HasSuffix(r.URL.Path, ".wasm"):
+						w.Header().Set("Content-Type", "application/wasm")
 					}
 					next.ServeHTTP(w, r)
 				})

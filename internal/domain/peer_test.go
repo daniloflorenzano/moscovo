@@ -142,3 +142,42 @@ func TestPeerSessionStateMachineAndVolume(t *testing.T) {
 		t.Fatalf("SetVolume(201) succeeded, expected error")
 	}
 }
+
+func TestNoiseSuppressionModeValidationAndCycle(t *testing.T) {
+	validTests := []struct {
+		mode NoiseSuppressionMode
+		want bool
+	}{
+		{NoiseSuppressionOff, true},
+		{NoiseSuppressionRNNoise, true},
+		{NoiseSuppressionSpeex, true},
+		{NoiseSuppressionGate, true},
+		{NoiseSuppressionMode(""), false},
+		{NoiseSuppressionMode("gtcrn"), false},
+		{NoiseSuppressionMode("RNNOISE"), false},
+	}
+
+	for _, tc := range validTests {
+		if got := IsValidNoiseSuppressionMode(tc.mode); got != tc.want {
+			t.Fatalf("IsValidNoiseSuppressionMode(%q) = %v, want %v", tc.mode, got, tc.want)
+		}
+	}
+
+	cycleTests := []struct {
+		current NoiseSuppressionMode
+		want    NoiseSuppressionMode
+	}{
+		{NoiseSuppressionOff, NoiseSuppressionRNNoise},
+		{NoiseSuppressionRNNoise, NoiseSuppressionSpeex},
+		{NoiseSuppressionSpeex, NoiseSuppressionGate},
+		{NoiseSuppressionGate, NoiseSuppressionOff},
+		{NoiseSuppressionMode(""), NoiseSuppressionRNNoise},
+		{NoiseSuppressionMode("unknown"), NoiseSuppressionRNNoise},
+	}
+
+	for _, tc := range cycleTests {
+		if got := NextNoiseSuppressionMode(tc.current); got != tc.want {
+			t.Fatalf("NextNoiseSuppressionMode(%q) = %q, want %q", tc.current, got, tc.want)
+		}
+	}
+}

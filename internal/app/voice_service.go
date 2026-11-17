@@ -3,10 +3,12 @@ package app
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,6 +24,7 @@ const (
 	EventHubState  = "hub:state"
 	EventRoomState = "room:roster"
 	EventPeerStats = "peer:stats"
+	EventMicRaw    = "audio:mic-raw"
 
 	defaultHubAddr = "127.0.0.1:7878"
 )
@@ -42,41 +45,43 @@ type ServiceConfig struct {
 
 // AppState is the single-screen state snapshot exposed to the Wails frontend.
 type AppState struct {
-	HubAddr      string               `json:"hubAddr"`
-	LocalID      string               `json:"localId"`
-	Nickname     string               `json:"nickname"`
-	HubStatus    string               `json:"hubStatus"`
-	MicDevice    string               `json:"micDevice"`
-	OutputDevice string               `json:"outputDevice"`
-	InCall       bool                 `json:"inCall"`
-	Muted        bool                 `json:"muted"`
-	Deafened     bool                 `json:"deafened"`
-	PushToTalk   bool                 `json:"pushToTalk"`
-	Speaking     bool                 `json:"speaking"`
-	LastError    string               `json:"lastError,omitempty"`
-	Peers        []domain.PeerSession `json:"peers"`
+	HubAddr          string                      `json:"hubAddr"`
+	LocalID          string                      `json:"localId"`
+	Nickname         string                      `json:"nickname"`
+	HubStatus        string                      `json:"hubStatus"`
+	MicDevice        string                      `json:"micDevice"`
+	OutputDevice     string                      `json:"outputDevice"`
+	InCall           bool                        `json:"inCall"`
+	Muted            bool                        `json:"muted"`
+	Deafened         bool                        `json:"deafened"`
+	PushToTalk       bool                        `json:"pushToTalk"`
+	Speaking         bool                        `json:"speaking"`
+	NoiseSuppression domain.NoiseSuppressionMode `json:"noiseSuppression"`
+	LastError        string                      `json:"lastError,omitempty"`
+	Peers            []domain.PeerSession        `json:"peers"`
 }
 
 // VoiceService coordinates the Hub signaling client, WebRTC mesh, and audio engine for the UI.
 type VoiceService struct {
-	mu              sync.Mutex
-	hubAddr         string
-	localID         string
-	nickname        string
-	hubConnState    transport.HubConnectionState
-	micDevice       string
-	outputDevice    string
-	inCall          bool
-	muted           bool
-	deafened        bool
-	pushToTalk      bool
-	lastError       string
-	peers           []domain.PeerSession
-	stunServers     []string
-	forceRelay      bool
-	includeLoopback bool
-	emit            EventEmitter
-	logger          *slog.Logger
+	mu               sync.Mutex
+	hubAddr          string
+	localID          string
+	nickname         string
+	hubConnState     transport.HubConnectionState
+	micDevice        string
+	outputDevice     string
+	inCall           bool
+	muted            bool
+	deafened         bool
+	pushToTalk       bool
+	noiseSuppression domain.NoiseSuppressionMode
+	lastError        string
+	peers            []domain.PeerSession
+	stunServers      []string
+	forceRelay       bool
+	includeLoopback  bool
+	emit             EventEmitter
+	logger           *slog.Logger
 
 	callCancel context.CancelFunc
 	callWG     *sync.WaitGroup
@@ -106,18 +111,19 @@ func NewVoiceService(cfg ServiceConfig) *VoiceService {
 	micDev, outDev := audio.DetectAudioDevices()
 
 	return &VoiceService{
-		hubAddr:         hubAddr,
-		localID:         generatePeerID(nickname),
-		nickname:        nickname,
-		hubConnState:    transport.HubOffline,
-		micDevice:       micDev,
-		outputDevice:    outDev,
-		stunServers:     cfg.STUNServers,
-		forceRelay:      cfg.ForceRelay,
-		includeLoopback: cfg.IncludeLoopback,
-		emit:            cfg.Emit,
-		logger:          logger,
-		peers:           []domain.PeerSession{},
+		hubAddr:          hubAddr,
+		localID:          generatePeerID(nickname),
+		nickname:         nickname,
+		hubConnState:     transport.HubOffline,
+		micDevice:        micDev,
+		outputDevice:     outDev,
+		noiseSuppression: domain.DefaultNoiseSuppressionMode,
+		stunServers:      cfg.STUNServers,
+		forceRelay:       cfg.ForceRelay,
+		includeLoopback:  cfg.IncludeLoopback,
+		emit:             cfg.Emit,
+		logger:           logger,
+		peers:            []domain.PeerSession{},
 	}
 }
 
@@ -196,6 +202,15 @@ func (s *VoiceService) JoinCall() (AppState, error) {
 	eng := audio.NewEngine(audio.EngineConfig{
 		OnSpeakingChange: func(speaking bool) {
 			s.handleLocalSpeakingChanged(speaking)
+		},
+		OnRawMicFrame: func(pcm []byte) {
+			s.mu.Lock()
+			active := s.inCall && s.noiseSuppression != domain.NoiseSuppressionOff
+			s.mu.Unlock()
+			if !active || len(pcm) == 0 {
+				return
+			}
+			s.emitState(EventMicRaw, base64.StdEncoding.EncodeToString(pcm))
 		},
 	})
 	eng.SetMuted(muted)
@@ -406,6 +421,65 @@ func (s *VoiceService) ToggleDeafen() (AppState, error) {
 	return state, nil
 }
 
+// CycleNoiseSuppression advances through off -> rnnoise -> speex -> gate -> off.
+func (s *VoiceService) CycleNoiseSuppression() (AppState, error) {
+	s.mu.Lock()
+	s.noiseSuppression = domain.NextNoiseSuppressionMode(s.noiseSuppression)
+	eng := s.audioEng
+	off := s.noiseSuppression == domain.NoiseSuppressionOff
+	state := s.snapshotLocked()
+	s.mu.Unlock()
+
+	if off && eng != nil {
+		eng.ClearProcessedMicFrame()
+	}
+	s.emitState(EventHubState, state)
+	return state, nil
+}
+
+// SetNoiseSuppression selects a specific client-side noise suppression mode.
+func (s *VoiceService) SetNoiseSuppression(mode string) (AppState, error) {
+	parsed := domain.NoiseSuppressionMode(strings.ToLower(strings.TrimSpace(mode)))
+	if !domain.IsValidNoiseSuppressionMode(parsed) {
+		err := fmt.Errorf("invalid noise suppression mode %q", mode)
+		s.setError(err.Error())
+		return s.GetState(), err
+	}
+
+	s.mu.Lock()
+	s.noiseSuppression = parsed
+	eng := s.audioEng
+	off := parsed == domain.NoiseSuppressionOff
+	state := s.snapshotLocked()
+	s.mu.Unlock()
+
+	if off && eng != nil {
+		eng.ClearProcessedMicFrame()
+	}
+	s.emitState(EventHubState, state)
+	return state, nil
+}
+
+// SubmitProcessedMicFrame accepts a base64-encoded 16kHz PCM16 frame denoised by the frontend AudioWorklet.
+func (s *VoiceService) SubmitProcessedMicFrame(pcmBase64 string) error {
+	if pcmBase64 == "" {
+		return nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(pcmBase64)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	active := s.inCall && s.noiseSuppression != domain.NoiseSuppressionOff
+	eng := s.audioEng
+	s.mu.Unlock()
+	if !active || eng == nil {
+		return nil
+	}
+	eng.PushProcessedMicFrame(raw)
+	return nil
+}
+
 // SetPeerVolume adjusts a remote peer's local playback percentage (0..200).
 func (s *VoiceService) SetPeerVolume(peerID string, volume int) (AppState, error) {
 	s.mu.Lock()
@@ -495,6 +569,44 @@ func (s *VoiceService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		state, err := s.SetPushToTalk(req.Active)
 		writeStateResponse(w, state, err)
+
+	case r.Method == http.MethodPost && path == "/mic/ns":
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		trimmed := strings.TrimSpace(string(body))
+		if trimmed != "" {
+			var req struct {
+				Mode string `json:"mode"`
+			}
+			if err := json.Unmarshal([]byte(trimmed), &req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req.Mode != "" {
+				state, setErr := s.SetNoiseSuppression(req.Mode)
+				writeStateResponse(w, state, setErr)
+				return
+			}
+		}
+		state, cycleErr := s.CycleNoiseSuppression()
+		writeStateResponse(w, state, cycleErr)
+
+	case r.Method == http.MethodPost && path == "/mic/frame":
+		var req struct {
+			PCM string `json:"pcm"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := s.SubmitProcessedMicFrame(req.PCM); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
 	case r.Method == http.MethodPost && path == "/peer/volume":
 		var req struct {
@@ -614,19 +726,20 @@ func (s *VoiceService) snapshotLocked() AppState {
 	}
 	peersCopy := append([]domain.PeerSession(nil), s.peers...)
 	return AppState{
-		HubAddr:      s.hubAddr,
-		LocalID:      s.localID,
-		Nickname:     s.nickname,
-		HubStatus:    status,
-		MicDevice:    s.micDevice,
-		OutputDevice: s.outputDevice,
-		InCall:       s.inCall,
-		Muted:        s.muted,
-		Deafened:     s.deafened,
-		PushToTalk:   s.pushToTalk,
-		Speaking:     speaking,
-		LastError:    s.lastError,
-		Peers:        peersCopy,
+		HubAddr:          s.hubAddr,
+		LocalID:          s.localID,
+		Nickname:         s.nickname,
+		HubStatus:        status,
+		MicDevice:        s.micDevice,
+		OutputDevice:     s.outputDevice,
+		InCall:           s.inCall,
+		Muted:            s.muted,
+		Deafened:         s.deafened,
+		PushToTalk:       s.pushToTalk,
+		Speaking:         speaking,
+		NoiseSuppression: s.noiseSuppression,
+		LastError:        s.lastError,
+		Peers:            peersCopy,
 	}
 }
 

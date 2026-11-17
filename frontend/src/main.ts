@@ -1,5 +1,9 @@
 // @ts-check
 
+import { createNoiseSuppressor } from "./noiseSuppressor.ts";
+
+/** @typedef {import("./noiseSuppressor.ts").NoiseSuppressionMode} NoiseSuppressionMode */
+
 /**
  * @typedef {Object} PeerSession
  * @property {string} id
@@ -25,6 +29,7 @@
  * @property {boolean} deafened
  * @property {boolean} pushToTalk
  * @property {boolean} speaking
+ * @property {NoiseSuppressionMode} noiseSuppression
  * @property {string} [lastError]
  * @property {PeerSession[]} peers
  */
@@ -44,6 +49,7 @@ let state = {
   deafened: false,
   pushToTalk: false,
   speaking: false,
+  noiseSuppression: "rnnoise",
   lastError: "",
   peers: [],
 };
@@ -52,6 +58,8 @@ let selectedPeerId = "";
 let editingHub = false;
 let pttHeld = false;
 let callCounter = 0;
+
+const noiseSuppressor = createNoiseSuppressor();
 
 const el = {
   hubSummary: /** @type {HTMLElement} */ (document.getElementById("hub-summary")),
@@ -72,6 +80,7 @@ const el = {
   callBtn: /** @type {HTMLButtonElement} */ (document.getElementById("call-btn")),
   muteBtn: /** @type {HTMLButtonElement} */ (document.getElementById("mute-btn")),
   deafenBtn: /** @type {HTMLButtonElement} */ (document.getElementById("deafen-btn")),
+  nsBtn: /** @type {HTMLButtonElement} */ (document.getElementById("ns-btn")),
 };
 
 /**
@@ -169,6 +178,8 @@ function setupWailsEvents() {
       state.peers = ev.data;
       ensureSelection();
       render();
+    } else if (ev.name === "audio:mic-raw" && typeof ev.data === "string") {
+      noiseSuppressor.pushRawMicBase64(ev.data);
     }
   };
 
@@ -192,6 +203,8 @@ function applyState(next) {
     ...next,
     peers: Array.isArray(next.peers) ? next.peers : [],
   };
+  const micActive = state.inCall && !state.deafened && (!state.muted || state.pushToTalk);
+  void noiseSuppressor.setMode(state.noiseSuppression || "rnnoise", micActive);
   ensureSelection();
   render();
 }
@@ -266,6 +279,21 @@ function render() {
   el.deafenBtn.textContent = state.deafened ? "[D] UNDEAF" : "[D] DEAFEN";
   el.deafenBtn.className = state.deafened ? "btn btn-danger" : "btn";
 
+  const nsMode = state.noiseSuppression || "rnnoise";
+  if (nsMode === "off") {
+    el.nsBtn.textContent = "[N] NS: OFF";
+    el.nsBtn.className = "btn";
+  } else if (nsMode === "speex") {
+    el.nsBtn.textContent = "[N] NS: SPEEX";
+    el.nsBtn.className = "btn btn-primary";
+  } else if (nsMode === "gate") {
+    el.nsBtn.textContent = "[N] NS: GATE";
+    el.nsBtn.className = "btn btn-warn";
+  } else {
+    el.nsBtn.textContent = "[N] NS: RNNOISE";
+    el.nsBtn.className = "btn btn-primary";
+  }
+
   renderPeers();
 }
 
@@ -286,14 +314,16 @@ function renderPeers() {
 
   const selfMeta = document.createElement("span");
   selfMeta.className = "peer-meta";
+  const nsMode = state.noiseSuppression || "rnnoise";
+  const nsSuffix = nsMode !== "off" ? ` · ${nsMode.toUpperCase()}` : "";
   if (state.deafened) {
     selfMeta.textContent = "DEAFENED";
   } else if (state.muted && state.pushToTalk) {
-    selfMeta.textContent = "MIC: PTT";
+    selfMeta.textContent = `MIC: PTT${nsSuffix}`;
   } else if (state.muted) {
     selfMeta.textContent = "MIC: MUTED";
   } else {
-    selfMeta.textContent = "MIC: ON";
+    selfMeta.textContent = `MIC: ON${nsSuffix}`;
   }
 
   selfRow.append(selfDot, selfName, selfMeta);
@@ -437,6 +467,10 @@ function wireControls() {
     void runAction(() => invokeService("ToggleDeafen", [], "/mic/deafen"));
   });
 
+  el.nsBtn.addEventListener("click", () => {
+    void runAction(() => invokeService("CycleNoiseSuppression", [], "/mic/ns"));
+  });
+
   window.addEventListener("keydown", (e) => {
     if (e.ctrlKey && e.key.toLowerCase() === "q") {
       e.preventDefault();
@@ -480,6 +514,11 @@ function wireControls() {
       case "D":
         e.preventDefault();
         void runAction(() => invokeService("ToggleDeafen", [], "/mic/deafen"));
+        break;
+      case "n":
+      case "N":
+        e.preventDefault();
+        void runAction(() => invokeService("CycleNoiseSuppression", [], "/mic/ns"));
         break;
       case "j":
       case "ArrowDown":
@@ -558,6 +597,9 @@ async function syncState() {
 }
 
 async function init() {
+  noiseSuppressor.onProcessedFrame((b64) => {
+    void invokeService("SubmitProcessedMicFrame", [b64], "/mic/frame", { pcm: b64 }).catch(() => {});
+  });
   setupWailsEvents();
   wireControls();
   render();

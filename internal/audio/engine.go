@@ -19,6 +19,8 @@ const (
 	speakingThreshold = 0.02
 	// speakingHangover keeps the speaking indicator steady across short pauses.
 	speakingHangover = 250 * time.Millisecond
+	// processedMicTTL bounds how long a noise-suppressed frame remains valid before falling back to raw mic.
+	processedMicTTL = 150 * time.Millisecond
 )
 
 // ErrEngineClosed is returned when reading from a stopped AudioIO engine.
@@ -60,6 +62,7 @@ type EngineConfig struct {
 	MicSource        func() (payload []byte, rms float64)
 	PlaybackSink     func(peerID string, sample AudioSample, volume int)
 	OnSpeakingChange func(speaking bool)
+	OnRawMicFrame    func(pcm []byte)
 }
 
 // Engine implements AudioIO with 20ms frame pacing, mute/deafen/PTT state, and per-peer stats.
@@ -68,6 +71,7 @@ type Engine struct {
 	micSource        func() ([]byte, float64)
 	playbackSink     func(peerID string, sample AudioSample, volume int)
 	onSpeakingChange func(bool)
+	onRawMicFrame    func([]byte)
 
 	mu            sync.RWMutex
 	started       bool
@@ -78,6 +82,9 @@ type Engine struct {
 	speaking      bool
 	speakingUntil time.Time
 	seq           uint64
+	processedMic  []byte
+	processedRMS  float64
+	processedAt   time.Time
 	peerStats     map[string]*PeerAudioStats
 	platformPlay  func([]byte)
 	platformClose func()
@@ -100,6 +107,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		micSource:        cfg.MicSource,
 		playbackSink:     cfg.PlaybackSink,
 		onSpeakingChange: cfg.OnSpeakingChange,
+		onRawMicFrame:    cfg.OnRawMicFrame,
 		peerStats:        make(map[string]*PeerAudioStats),
 		closeCh:          make(chan struct{}),
 	}
@@ -189,12 +197,25 @@ func (e *Engine) ReadMicSample(ctx context.Context) (AudioSample, error) {
 		effMuted := e.isEffectivelyMutedLocked()
 		payload := append([]byte(nil), opusSilenceFrame...)
 		rms := 0.0
-		if !effMuted && e.micSource != nil {
-			customPayload, customRMS := e.micSource()
-			if len(customPayload) > 0 {
-				payload = append([]byte(nil), customPayload...)
+		var rawFrame []byte
+		var rawCb func([]byte)
+		if !effMuted {
+			if e.micSource != nil {
+				customPayload, customRMS := e.micSource()
+				if len(customPayload) > 0 {
+					payload = append([]byte(nil), customPayload...)
+					if e.onRawMicFrame != nil {
+						rawFrame = append([]byte(nil), customPayload...)
+						rawCb = e.onRawMicFrame
+					}
+				}
+				rms = customRMS
 			}
-			rms = customRMS
+			if len(e.processedMic) > 0 && now.Sub(e.processedAt) <= processedMicTTL {
+				payload = e.processedMic
+				rms = e.processedRMS
+				e.processedMic = nil
+			}
 		}
 
 		if !effMuted && rms >= speakingThreshold {
@@ -207,6 +228,9 @@ func (e *Engine) ReadMicSample(ctx context.Context) (AudioSample, error) {
 		seq := e.seq
 		e.mu.Unlock()
 
+		if rawCb != nil {
+			rawCb(rawFrame)
+		}
 		if changed && cb != nil {
 			cb(nextSpeaking)
 		}
@@ -372,6 +396,33 @@ func (e *Engine) PeerSpeaking(peerID string) bool {
 	return ok && stats.Speaking
 }
 
+// PushProcessedMicFrame injects a client-side noise-suppressed PCM16 frame for the next ReadMicSample tick.
+func (e *Engine) PushProcessedMicFrame(pcm []byte) {
+	if len(pcm) == 0 {
+		return
+	}
+	copied := append([]byte(nil), pcm...)
+	rms := ComputePCM16RMS(copied)
+	now := time.Now()
+
+	e.mu.Lock()
+	if !e.closed {
+		e.processedMic = copied
+		e.processedRMS = rms
+		e.processedAt = now
+	}
+	e.mu.Unlock()
+}
+
+// ClearProcessedMicFrame discards any buffered noise-suppressed mic frame so raw mic resumes immediately.
+func (e *Engine) ClearProcessedMicFrame() {
+	e.mu.Lock()
+	e.processedMic = nil
+	e.processedRMS = 0
+	e.processedAt = time.Time{}
+	e.mu.Unlock()
+}
+
 // Close shuts down the audio engine, closes platform streams, and stops frame pacing.
 func (e *Engine) Close() error {
 	e.closeOnce.Do(func() {
@@ -379,6 +430,9 @@ func (e *Engine) Close() error {
 		e.mu.Lock()
 		e.closed = true
 		e.speaking = false
+		e.processedMic = nil
+		e.processedRMS = 0
+		e.processedAt = time.Time{}
 		closePlatform := e.platformClose
 		e.platformClose = nil
 		e.platformPlay = nil
