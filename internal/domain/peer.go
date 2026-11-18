@@ -62,16 +62,18 @@ var allowedTransitions = map[PeerState][]PeerState{
 	StateClosed:         nil,
 }
 
-// PeerSession captures the state and audio mix preferences of a remote peer.
+// PeerSession captures the state and audio/screen-share status of a remote peer.
 type PeerSession struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	State       PeerState `json:"state"`
-	Volume      int       `json:"volume"`
-	LocalMuted  bool      `json:"localMuted"`
-	RemoteMuted bool      `json:"remoteMuted"`
-	Speaking    bool      `json:"speaking"`
-	RTTMs       int       `json:"rttMs"`
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	State         PeerState `json:"state"`
+	Volume        int       `json:"volume"`
+	LocalMuted    bool      `json:"localMuted"`
+	RemoteMuted   bool      `json:"remoteMuted"`
+	Speaking      bool      `json:"speaking"`
+	RTTMs         int       `json:"rttMs"`
+	ScreenSharing bool      `json:"screenSharing"`
+	ScreenAudio   bool      `json:"screenAudio,omitempty"`
 }
 
 // NewPeerSession constructs a peer session starting in StateIdle at 100% local volume.

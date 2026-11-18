@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,11 +13,14 @@ import (
 	"time"
 
 	"github.com/pion/logging"
+	"github.com/pion/rtcp"
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
 	"moscovo/internal/audio"
 	"moscovo/internal/domain"
+	"moscovo/internal/screenshare/encoder"
 )
 
 const (
@@ -28,26 +32,33 @@ var defaultSTUNServers = []string{"stun:stun.l.google.com:19302"}
 
 // MeshConfig configures the client-side full-mesh Pion WebRTC engine.
 type MeshConfig struct {
-	LocalPeer        domain.PeerInfo
-	STUNServers      []string
-	ForceRelay       bool
-	IncludeLoopback  bool
-	PingInterval     time.Duration
-	Audio            audio.AudioIO
-	SendSignal       func(context.Context, domain.SignalEnvelope) error
-	OnSessionsChange func([]domain.PeerSession)
-	Logger           *slog.Logger
+	LocalPeer               domain.PeerInfo
+	STUNServers             []string
+	ForceRelay              bool
+	IncludeLoopback         bool
+	PingInterval            time.Duration
+	Audio                   audio.AudioIO
+	SendSignal              func(context.Context, domain.SignalEnvelope) error
+	OnSessionsChange        func([]domain.PeerSession)
+	OnRemoteScreenFrame     func(peerID string, jpegData []byte, width, height int)
+	OnRemoteScreenState     func(peerID string, active bool, hasAudio bool)
+	OnScreenBitrateChange   func(rembBps uint64, lossFraction float64, rttMs int)
+	OnScreenKeyframeRequest func()
+	Logger                  *slog.Logger
 }
 
 type controlMessage struct {
-	Kind     string `json:"kind"`
-	SentAtNs int64  `json:"sentAtNs,omitempty"`
-	Muted    bool   `json:"muted,omitempty"`
-	Speaking bool   `json:"speaking,omitempty"`
+	Kind          string `json:"kind"`
+	SentAtNs      int64  `json:"sentAtNs,omitempty"`
+	Muted         bool   `json:"muted,omitempty"`
+	Speaking      bool   `json:"speaking,omitempty"`
+	ScreenSharing bool   `json:"screenSharing,omitempty"`
+	ScreenAudio   bool   `json:"screenAudio,omitempty"`
 }
 
 type peerConnEntry struct {
 	mu                 sync.Mutex
+	negotiateMu        sync.Mutex
 	pc                 *webrtc.PeerConnection
 	dc                 *webrtc.DataChannel
 	session            domain.PeerSession
@@ -56,6 +67,8 @@ type peerConnEntry struct {
 	pendingCandidates  []webrtc.ICECandidateInit
 	dcSpeaking         bool
 	audioSpeakingUntil time.Time
+	screenVideoSender  *webrtc.RTPSender
+	screenAudioSender  *webrtc.RTPSender
 	closed             bool
 	done               chan struct{}
 	closeOnce          sync.Once
@@ -80,27 +93,39 @@ func (e *peerConnEntry) closeResources() {
 	})
 }
 
-// WebRTCMesh manages per-peer WebRTC connections, Opus tracks, control DataChannels, and path stats.
+// WebRTCMesh manages per-peer WebRTC connections, Opus tracks, screen-share tracks, control DataChannels, and path stats.
 type WebRTCMesh struct {
-	localPeer        domain.PeerInfo
-	stunServers      []string
-	forceRelay       bool
-	includeLoopback  bool
-	pingInterval     time.Duration
-	audioIO          audio.AudioIO
-	sendSignal       func(context.Context, domain.SignalEnvelope) error
-	onSessionsChange func([]domain.PeerSession)
-	logger           *slog.Logger
+	localPeer               domain.PeerInfo
+	stunServers             []string
+	forceRelay              bool
+	includeLoopback         bool
+	pingInterval            time.Duration
+	audioIO                 audio.AudioIO
+	sendSignal              func(context.Context, domain.SignalEnvelope) error
+	onSessionsChange        func([]domain.PeerSession)
+	onRemoteScreenFrame     func(string, []byte, int, int)
+	onRemoteScreenState     func(string, bool, bool)
+	onScreenBitrateChange   func(uint64, float64, int)
+	onScreenKeyframeRequest func()
+	logger                  *slog.Logger
 
 	api        *webrtc.API
 	localTrack *webrtc.TrackLocalStaticSample
 
-	mu         sync.Mutex
-	peers      map[string]*peerConnEntry
-	turnCreds  *domain.TURNCredentials
-	localMuted bool
-	speaking   bool
-	closed     bool
+	mu               sync.Mutex
+	peers            map[string]*peerConnEntry
+	turnCreds        *domain.TURNCredentials
+	localMuted       bool
+	speaking         bool
+	screenSharing    bool
+	screenAudio      bool
+	screenCodecMime  string
+	screenVideoTrack *webrtc.TrackLocalStaticSample
+	screenAudioTrack *webrtc.TrackLocalStaticSample
+	remoteVideoMime  string
+	viewerPC         *webrtc.PeerConnection
+	viewerVideoTrack *webrtc.TrackLocalStaticRTP
+	closed           bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -160,20 +185,24 @@ func NewWebRTCMesh(cfg MeshConfig) (*WebRTCMesh, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &WebRTCMesh{
-		localPeer:        cfg.LocalPeer,
-		stunServers:      stunServers,
-		forceRelay:       cfg.ForceRelay,
-		includeLoopback:  cfg.IncludeLoopback,
-		pingInterval:     pingInterval,
-		audioIO:          cfg.Audio,
-		sendSignal:       cfg.SendSignal,
-		onSessionsChange: cfg.OnSessionsChange,
-		logger:           logger,
-		api:              api,
-		localTrack:       localTrack,
-		peers:            make(map[string]*peerConnEntry),
-		ctx:              ctx,
-		cancel:           cancel,
+		localPeer:               cfg.LocalPeer,
+		stunServers:             stunServers,
+		forceRelay:              cfg.ForceRelay,
+		includeLoopback:         cfg.IncludeLoopback,
+		pingInterval:            pingInterval,
+		audioIO:                 cfg.Audio,
+		sendSignal:              cfg.SendSignal,
+		onSessionsChange:        cfg.OnSessionsChange,
+		onRemoteScreenFrame:     cfg.OnRemoteScreenFrame,
+		onRemoteScreenState:     cfg.OnRemoteScreenState,
+		onScreenBitrateChange:   cfg.OnScreenBitrateChange,
+		onScreenKeyframeRequest: cfg.OnScreenKeyframeRequest,
+		logger:                  logger,
+		api:                     api,
+		localTrack:              localTrack,
+		peers:                   make(map[string]*peerConnEntry),
+		ctx:                     ctx,
+		cancel:                  cancel,
 	}
 
 	if err := m.audioIO.Start(ctx); err != nil {
@@ -302,6 +331,9 @@ func (m *WebRTCMesh) handleOffer(env domain.SignalEnvelope) error {
 		return err
 	}
 
+	entry.negotiateMu.Lock()
+	defer entry.negotiateMu.Unlock()
+
 	entry.mu.Lock()
 	if entry.closed {
 		entry.mu.Unlock()
@@ -309,6 +341,12 @@ func (m *WebRTCMesh) handleOffer(env domain.SignalEnvelope) error {
 	}
 	pc := entry.pc
 	entry.mu.Unlock()
+
+	if pc.SignalingState() != webrtc.SignalingStateStable {
+		if rbErr := pc.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); rbErr != nil {
+			m.logger.Debug("sdp rollback before remote offer", "peerId", env.SenderID, "err", rbErr)
+		}
+	}
 
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
@@ -484,11 +522,36 @@ func (m *WebRTCMesh) createPeerEntryLocked(remote domain.PeerInfo, initiate bool
 		return nil, fmt.Errorf("add local audio track for %s: %w", remote.ID, err)
 	}
 
+	var screenVideoSender, screenAudioSender *webrtc.RTPSender
+	if m.screenVideoTrack != nil {
+		vs, addErr := pc.AddTrack(m.screenVideoTrack)
+		if addErr != nil {
+			_ = pc.Close()
+			return nil, fmt.Errorf("add local screen video track for %s: %w", remote.ID, addErr)
+		}
+		screenVideoSender = vs
+	}
+	if m.screenAudioTrack != nil {
+		as, addErr := pc.AddTrack(m.screenAudioTrack)
+		if addErr != nil {
+			_ = pc.Close()
+			return nil, fmt.Errorf("add local screen audio track for %s: %w", remote.ID, addErr)
+		}
+		screenAudioSender = as
+	}
+
 	entry := &peerConnEntry{
-		pc:       pc,
-		session:  session,
-		initiate: initiate,
-		done:     make(chan struct{}),
+		pc:                pc,
+		session:           session,
+		initiate:          initiate,
+		screenVideoSender: screenVideoSender,
+		screenAudioSender: screenAudioSender,
+		done:              make(chan struct{}),
+	}
+
+	if screenVideoSender != nil {
+		m.wg.Add(1)
+		go m.readSenderRTCP(entry, screenVideoSender)
 	}
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -517,7 +580,14 @@ func (m *WebRTCMesh) createPeerEntryLocked(remote domain.PeerInfo, initiate bool
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		m.wg.Add(1)
-		go m.readRemoteTrack(entry, track)
+		switch {
+		case track.Kind() == webrtc.RTPCodecTypeVideo:
+			go m.readRemoteVideoTrack(entry, track)
+		case strings.HasPrefix(track.ID(), "screenshare") || strings.HasPrefix(track.StreamID(), "screenshare"):
+			go m.readRemoteScreenAudioTrack(entry, track)
+		default:
+			go m.readRemoteTrack(entry, track)
+		}
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -549,6 +619,12 @@ func (m *WebRTCMesh) createPeerEntryLocked(remote domain.PeerInfo, initiate bool
 }
 
 func (m *WebRTCMesh) sendOffer(entry *peerConnEntry) error {
+	entry.negotiateMu.Lock()
+	defer entry.negotiateMu.Unlock()
+	return m.sendOfferLocked(entry)
+}
+
+func (m *WebRTCMesh) sendOfferLocked(entry *peerConnEntry) error {
 	entry.mu.Lock()
 	if entry.closed {
 		entry.mu.Unlock()
@@ -631,12 +707,16 @@ func (m *WebRTCMesh) attachDataChannel(entry *peerConnEntry, dc *webrtc.DataChan
 		m.mu.Lock()
 		muted := m.localMuted
 		speaking := m.speaking
+		screenSharing := m.screenSharing
+		screenAudio := m.screenAudio
 		m.mu.Unlock()
 
 		_ = sendControlJSON(dc, controlMessage{
-			Kind:     "state",
-			Muted:    muted,
-			Speaking: speaking,
+			Kind:          "state",
+			Muted:         muted,
+			Speaking:      speaking,
+			ScreenSharing: screenSharing,
+			ScreenAudio:   screenAudio,
 		})
 		_ = sendControlJSON(dc, controlMessage{
 			Kind:     "ping",
@@ -676,8 +756,16 @@ func (m *WebRTCMesh) attachDataChannel(entry *peerConnEntry, dc *webrtc.DataChan
 			entry.session.RemoteMuted = ctrl.Muted
 			entry.dcSpeaking = ctrl.Speaking && !ctrl.Muted
 			entry.session.Speaking = !entry.session.RemoteMuted && (entry.dcSpeaking || now.Before(entry.audioSpeakingUntil))
+			prevScreen := entry.session.ScreenSharing
+			prevScreenAud := entry.session.ScreenAudio
+			entry.session.ScreenSharing = ctrl.ScreenSharing
+			entry.session.ScreenAudio = ctrl.ScreenAudio
+			peerID := entry.session.ID
 			entry.mu.Unlock()
 			m.notifySessionsChanged()
+			if (prevScreen != ctrl.ScreenSharing || prevScreenAud != ctrl.ScreenAudio) && m.onRemoteScreenState != nil {
+				m.onRemoteScreenState(peerID, ctrl.ScreenSharing, ctrl.ScreenAudio)
+			}
 		}
 	})
 }
@@ -834,6 +922,8 @@ func (m *WebRTCMesh) BroadcastControlState(muted, speaking bool) {
 	m.mu.Lock()
 	m.localMuted = muted
 	m.speaking = speaking && !muted
+	screenSharing := m.screenSharing
+	screenAudio := m.screenAudio
 	entries := make([]*peerConnEntry, 0, len(m.peers))
 	for _, e := range m.peers {
 		entries = append(entries, e)
@@ -841,9 +931,11 @@ func (m *WebRTCMesh) BroadcastControlState(muted, speaking bool) {
 	m.mu.Unlock()
 
 	msg := controlMessage{
-		Kind:     "state",
-		Muted:    muted,
-		Speaking: speaking && !muted,
+		Kind:          "state",
+		Muted:         muted,
+		Speaking:      speaking && !muted,
+		ScreenSharing: screenSharing,
+		ScreenAudio:   screenAudio,
 	}
 	for _, entry := range entries {
 		entry.mu.Lock()
@@ -853,6 +945,416 @@ func (m *WebRTCMesh) BroadcastControlState(muted, speaking bool) {
 		if !closed && dc != nil {
 			_ = sendControlJSON(dc, msg)
 		}
+	}
+}
+
+// StartScreenShareTracks dynamically attaches video (and optional isolated system-audio) tracks
+// to all connected PeerConnections and triggers glare-safe SDP renegotiation (FR-04, FR-06).
+func (m *WebRTCMesh) StartScreenShareTracks(codecMime string, includeAudio bool) error {
+	if strings.TrimSpace(codecMime) == "" {
+		codecMime = webrtc.MimeTypeVP8
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return errors.New("webrtc mesh closed")
+	}
+	if m.screenSharing {
+		m.mu.Unlock()
+		return nil
+	}
+
+	streamID := "screenshare-" + m.localPeer.ID
+	videoTrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: codecMime, ClockRate: 90000},
+		"screenshare-video",
+		streamID,
+	)
+	if err != nil {
+		m.mu.Unlock()
+		return fmt.Errorf("create local screen video track: %w", err)
+	}
+
+	var audioTrack *webrtc.TrackLocalStaticSample
+	if includeAudio {
+		audioTrack, err = webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+			"screenshare-audio",
+			streamID,
+		)
+		if err != nil {
+			m.mu.Unlock()
+			return fmt.Errorf("create local screen audio track: %w", err)
+		}
+	}
+
+	m.screenSharing = true
+	m.screenAudio = includeAudio
+	m.screenCodecMime = codecMime
+	m.screenVideoTrack = videoTrack
+	m.screenAudioTrack = audioTrack
+	localMuted := m.localMuted
+	speaking := m.speaking
+	entries := make([]*peerConnEntry, 0, len(m.peers))
+	for _, e := range m.peers {
+		entries = append(entries, e)
+	}
+	m.mu.Unlock()
+
+	for _, entry := range entries {
+		entry.negotiateMu.Lock()
+		entry.mu.Lock()
+		if entry.closed {
+			entry.mu.Unlock()
+			entry.negotiateMu.Unlock()
+			continue
+		}
+		pc := entry.pc
+		entry.mu.Unlock()
+
+		vs, addVErr := pc.AddTrack(videoTrack)
+		if addVErr != nil {
+			entry.negotiateMu.Unlock()
+			m.logger.Warn("add screen video track failed", "peerId", entry.session.ID, "err", addVErr)
+			continue
+		}
+		var as *webrtc.RTPSender
+		if audioTrack != nil {
+			var addAErr error
+			as, addAErr = pc.AddTrack(audioTrack)
+			if addAErr != nil {
+				m.logger.Warn("add screen audio track failed", "peerId", entry.session.ID, "err", addAErr)
+			}
+		}
+
+		entry.mu.Lock()
+		entry.screenVideoSender = vs
+		entry.screenAudioSender = as
+		entry.mu.Unlock()
+
+		m.wg.Add(1)
+		go m.readSenderRTCP(entry, vs)
+
+		if err := m.sendOfferLocked(entry); err != nil {
+			m.logger.Warn("renegotiate screen share offer failed", "peerId", entry.session.ID, "err", err)
+		}
+		entry.negotiateMu.Unlock()
+	}
+
+	m.BroadcastControlState(localMuted, speaking)
+	return nil
+}
+
+// WriteScreenVideoSample writes one encoded video frame onto the active screen-share video track.
+func (m *WebRTCMesh) WriteScreenVideoSample(sample media.Sample) error {
+	m.mu.Lock()
+	track := m.screenVideoTrack
+	m.mu.Unlock()
+	if track == nil {
+		return nil
+	}
+	err := track.WriteSample(sample)
+	if errors.Is(err, webrtc.ErrConnectionClosed) {
+		return nil
+	}
+	return err
+}
+
+// WriteScreenAudioSample writes one isolated desktop loopback audio sample onto the screen-share audio track.
+func (m *WebRTCMesh) WriteScreenAudioSample(sample media.Sample) error {
+	m.mu.Lock()
+	track := m.screenAudioTrack
+	m.mu.Unlock()
+	if track == nil {
+		return nil
+	}
+	err := track.WriteSample(sample)
+	if errors.Is(err, webrtc.ErrConnectionClosed) {
+		return nil
+	}
+	return err
+}
+
+// StopScreenShareTracks removes screen-share tracks from all PeerConnections and triggers SDP renegotiation (FR-05).
+func (m *WebRTCMesh) StopScreenShareTracks() error {
+	m.mu.Lock()
+	if !m.screenSharing && m.screenVideoTrack == nil && m.screenAudioTrack == nil {
+		m.mu.Unlock()
+		return nil
+	}
+	m.screenSharing = false
+	m.screenAudio = false
+	m.screenCodecMime = ""
+	m.screenVideoTrack = nil
+	m.screenAudioTrack = nil
+	localMuted := m.localMuted
+	speaking := m.speaking
+	entries := make([]*peerConnEntry, 0, len(m.peers))
+	for _, e := range m.peers {
+		entries = append(entries, e)
+	}
+	m.mu.Unlock()
+
+	for _, entry := range entries {
+		entry.negotiateMu.Lock()
+		entry.mu.Lock()
+		closed := entry.closed
+		pc := entry.pc
+		vs := entry.screenVideoSender
+		as := entry.screenAudioSender
+		entry.screenVideoSender = nil
+		entry.screenAudioSender = nil
+		entry.mu.Unlock()
+
+		if closed || pc == nil {
+			entry.negotiateMu.Unlock()
+			continue
+		}
+		removed := false
+		if vs != nil {
+			if err := pc.RemoveTrack(vs); err == nil {
+				removed = true
+			}
+		}
+		if as != nil {
+			if err := pc.RemoveTrack(as); err == nil {
+				removed = true
+			}
+		}
+		if removed {
+			if err := m.sendOfferLocked(entry); err != nil {
+				m.logger.Debug("renegotiate screen share removal failed", "peerId", entry.session.ID, "err", err)
+			}
+		}
+		entry.negotiateMu.Unlock()
+	}
+
+	m.BroadcastControlState(localMuted, speaking)
+	return nil
+}
+
+// NegotiateViewerSDP establishes a local loopback PeerConnection to bridge incoming remote video
+// tracks to the Wails WebView frontend's RTCPeerConnection.ontrack event.
+func (m *WebRTCMesh) NegotiateViewerSDP(offerSDP string) (string, error) {
+	if strings.TrimSpace(offerSDP) == "" {
+		return "", errors.New("viewer offer sdp cannot be empty")
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return "", errors.New("webrtc mesh closed")
+	}
+	oldPC := m.viewerPC
+	mime := m.remoteVideoMime
+	if mime == "" {
+		mime = webrtc.MimeTypeVP8
+	}
+	m.mu.Unlock()
+
+	if oldPC != nil {
+		_ = oldPC.Close()
+	}
+
+	viewerPC, err := m.api.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		return "", fmt.Errorf("create viewer peer connection: %w", err)
+	}
+	viewerTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: mime, ClockRate: 90000},
+		"remote-screen-video",
+		"remote-screen",
+	)
+	if err != nil {
+		_ = viewerPC.Close()
+		return "", fmt.Errorf("create viewer video track: %w", err)
+	}
+	if _, err := viewerPC.AddTrack(viewerTrack); err != nil {
+		_ = viewerPC.Close()
+		return "", fmt.Errorf("add viewer track: %w", err)
+	}
+
+	if err := viewerPC.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  offerSDP,
+	}); err != nil {
+		_ = viewerPC.Close()
+		return "", fmt.Errorf("set viewer remote offer: %w", err)
+	}
+
+	answer, err := viewerPC.CreateAnswer(nil)
+	if err != nil {
+		_ = viewerPC.Close()
+		return "", fmt.Errorf("create viewer answer: %w", err)
+	}
+	gatherComplete := webrtc.GatheringCompletePromise(viewerPC)
+	if err := viewerPC.SetLocalDescription(answer); err != nil {
+		_ = viewerPC.Close()
+		return "", fmt.Errorf("set viewer local answer: %w", err)
+	}
+	select {
+	case <-gatherComplete:
+	case <-time.After(500 * time.Millisecond):
+	case <-m.ctx.Done():
+	}
+
+	localDesc := viewerPC.LocalDescription()
+	if localDesc == nil {
+		localDesc = &answer
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		_ = viewerPC.Close()
+		return "", errors.New("webrtc mesh closed")
+	}
+	m.viewerPC = viewerPC
+	m.viewerVideoTrack = viewerTrack
+	m.mu.Unlock()
+
+	return localDesc.SDP, nil
+}
+
+func (m *WebRTCMesh) readSenderRTCP(entry *peerConnEntry, sender *webrtc.RTPSender) {
+	defer m.wg.Done()
+	for {
+		pkts, _, err := sender.ReadRTCP()
+		if err != nil {
+			return
+		}
+		entry.mu.Lock()
+		rttMs := entry.session.RTTMs
+		entry.mu.Unlock()
+
+		for _, pkt := range pkts {
+			switch p := pkt.(type) {
+			case *rtcp.ReceiverEstimatedMaximumBitrate:
+				if m.onScreenBitrateChange != nil && p.Bitrate > 0 {
+					m.onScreenBitrateChange(uint64(p.Bitrate), 0, rttMs)
+				}
+			case *rtcp.ReceiverReport:
+				for _, rep := range p.Reports {
+					if m.onScreenBitrateChange != nil {
+						loss := float64(rep.FractionLost) / 256.0
+						m.onScreenBitrateChange(0, loss, rttMs)
+					}
+				}
+			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+				if m.onScreenKeyframeRequest != nil {
+					m.onScreenKeyframeRequest()
+				}
+			}
+		}
+	}
+}
+
+func (m *WebRTCMesh) readRemoteVideoTrack(entry *peerConnEntry, track *webrtc.TrackRemote) {
+	defer m.wg.Done()
+
+	codecMime := track.Codec().MimeType
+	m.mu.Lock()
+	m.remoteVideoMime = codecMime
+	m.mu.Unlock()
+
+	entry.mu.Lock()
+	peerID := entry.session.ID
+	entry.session.ScreenSharing = true
+	hasAudio := entry.session.ScreenAudio
+	entry.mu.Unlock()
+
+	m.notifySessionsChanged()
+	if m.onRemoteScreenState != nil {
+		m.onRemoteScreenState(peerID, true, hasAudio)
+	}
+
+	decoder := encoder.NewVP8StreamDecoder()
+	defer func() { _ = decoder.Close() }()
+
+	var frameBuf bytes.Buffer
+	isVP8 := strings.EqualFold(codecMime, webrtc.MimeTypeVP8)
+
+	for {
+		pkt, _, err := track.ReadRTP()
+		if err != nil {
+			break
+		}
+
+		// Forward RTP packet to frontend WebRTC viewer bridge if connected.
+		m.mu.Lock()
+		vt := m.viewerVideoTrack
+		vMime := m.remoteVideoMime
+		m.mu.Unlock()
+		if vt != nil && strings.EqualFold(vMime, codecMime) {
+			_ = vt.WriteRTP(pkt)
+		}
+
+		if isVP8 {
+			var vp8Pkt codecs.VP8Packet
+			if _, unmarshalErr := vp8Pkt.Unmarshal(pkt.Payload); unmarshalErr != nil {
+				continue
+			}
+			if vp8Pkt.S == 1 && vp8Pkt.PID == 0 && frameBuf.Len() > 0 {
+				frameBuf.Reset()
+			}
+			if frameBuf.Len()+len(vp8Pkt.Payload) <= 4*1024*1024 {
+				frameBuf.Write(vp8Pkt.Payload)
+			} else {
+				frameBuf.Reset()
+				continue
+			}
+			if pkt.Header.Marker && frameBuf.Len() > 0 {
+				if jpg, w, h, ok := decoder.Decode(frameBuf.Bytes()); ok && m.onRemoteScreenFrame != nil {
+					m.onRemoteScreenFrame(peerID, jpg, w, h)
+				}
+				frameBuf.Reset()
+			}
+		}
+	}
+
+	entry.mu.Lock()
+	closed := entry.closed
+	entry.session.ScreenSharing = false
+	entry.session.ScreenAudio = false
+	entry.mu.Unlock()
+	if !closed {
+		m.notifySessionsChanged()
+		if m.onRemoteScreenState != nil {
+			m.onRemoteScreenState(peerID, false, false)
+		}
+	}
+}
+
+func (m *WebRTCMesh) readRemoteScreenAudioTrack(entry *peerConnEntry, track *webrtc.TrackRemote) {
+	defer m.wg.Done()
+	entry.mu.Lock()
+	peerID := entry.session.ID
+	entry.session.ScreenAudio = true
+	entry.mu.Unlock()
+	m.notifySessionsChanged()
+
+	for {
+		pkt, _, err := track.ReadRTP()
+		if err != nil {
+			return
+		}
+		now := time.Now()
+		entry.mu.Lock()
+		closed := entry.closed
+		volume := entry.session.Volume
+		localMuted := entry.session.LocalMuted
+		entry.mu.Unlock()
+		if closed {
+			return
+		}
+
+		_ = m.audioIO.WritePeerSample("screen:"+peerID, audio.AudioSample{
+			Data:      pkt.Payload,
+			Duration:  audio.DefaultFrameDuration,
+			Timestamp: now,
+			Sequence:  uint64(pkt.SequenceNumber),
+		}, volume, localMuted)
 	}
 }
 
@@ -900,6 +1402,9 @@ func (m *WebRTCMesh) Close() error {
 		return nil
 	}
 	m.closed = true
+	viewerPC := m.viewerPC
+	m.viewerPC = nil
+	m.viewerVideoTrack = nil
 	entries := make([]*peerConnEntry, 0, len(m.peers))
 	for id, entry := range m.peers {
 		entries = append(entries, entry)
@@ -907,6 +1412,9 @@ func (m *WebRTCMesh) Close() error {
 	}
 	m.mu.Unlock()
 
+	if viewerPC != nil {
+		_ = viewerPC.Close()
+	}
 	for _, entry := range entries {
 		entry.closeResources()
 	}

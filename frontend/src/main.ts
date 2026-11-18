@@ -14,6 +14,19 @@ import { createNoiseSuppressor } from "./noiseSuppressor.ts";
  * @property {boolean} remoteMuted
  * @property {boolean} speaking
  * @property {number} rttMs
+ * @property {boolean} [screenSharing]
+ * @property {boolean} [screenAudio]
+ */
+
+/**
+ * @typedef {Object} ShareableSource
+ * @property {string} id
+ * @property {string} title
+ * @property {"screen" | "window"} type
+ * @property {string} thumbnail
+ * @property {number} [width]
+ * @property {number} [height]
+ * @property {boolean} [isPrimary]
  */
 
 /**
@@ -30,6 +43,10 @@ import { createNoiseSuppressor } from "./noiseSuppressor.ts";
  * @property {boolean} pushToTalk
  * @property {boolean} speaking
  * @property {NoiseSuppressionMode} noiseSuppression
+ * @property {string} [screenShareState]
+ * @property {boolean} [screenSharing]
+ * @property {string} [activeScreenPeerId]
+ * @property {boolean} [isWayland]
  * @property {string} [lastError]
  * @property {PeerSession[]} peers
  */
@@ -50,6 +67,10 @@ let state = {
   pushToTalk: false,
   speaking: false,
   noiseSuppression: "rnnoise",
+  screenShareState: "IDLE",
+  screenSharing: false,
+  activeScreenPeerId: "",
+  isWayland: false,
   lastError: "",
   peers: [],
 };
@@ -58,6 +79,17 @@ let selectedPeerId = "";
 let editingHub = false;
 let pttHeld = false;
 let callCounter = 0;
+
+let shareModalOpen = false;
+/** @type {ShareableSource[]} */
+let shareSources = [];
+let selectedSourceId = "";
+let viewerHidden = false;
+let viewerExpanded = false;
+let viewingPeerId = "";
+/** @type {RTCPeerConnection | null} */
+let viewerPC = null;
+let viewerNegotiating = false;
 
 const noiseSuppressor = createNoiseSuppressor();
 
@@ -75,12 +107,27 @@ const el = {
   micDeviceName: /** @type {HTMLElement} */ (document.getElementById("mic-device-name")),
   outDeviceRow: /** @type {HTMLElement} */ (document.getElementById("out-device-row")),
   outDeviceName: /** @type {HTMLElement} */ (document.getElementById("out-device-name")),
+  screenStage: /** @type {HTMLElement} */ (document.getElementById("screen-stage")),
+  stageTitle: /** @type {HTMLElement} */ (document.getElementById("stage-title")),
+  stageExpandBtn: /** @type {HTMLButtonElement} */ (document.getElementById("stage-expand-btn")),
+  stageHideBtn: /** @type {HTMLButtonElement} */ (document.getElementById("stage-hide-btn")),
+  remoteScreenCanvas: /** @type {HTMLCanvasElement} */ (document.getElementById("remote-screen-canvas")),
+  remoteScreenVideo: /** @type {HTMLVideoElement} */ (document.getElementById("remote-screen-video")),
   roomMeta: /** @type {HTMLElement} */ (document.getElementById("room-meta")),
   peerList: /** @type {HTMLElement} */ (document.getElementById("peer-list")),
   callBtn: /** @type {HTMLButtonElement} */ (document.getElementById("call-btn")),
   muteBtn: /** @type {HTMLButtonElement} */ (document.getElementById("mute-btn")),
   deafenBtn: /** @type {HTMLButtonElement} */ (document.getElementById("deafen-btn")),
   nsBtn: /** @type {HTMLButtonElement} */ (document.getElementById("ns-btn")),
+  shareBtn: /** @type {HTMLButtonElement} */ (document.getElementById("share-btn")),
+  shareModal: /** @type {HTMLElement} */ (document.getElementById("share-modal")),
+  shareRefreshBtn: /** @type {HTMLButtonElement} */ (document.getElementById("share-refresh-btn")),
+  shareResSelect: /** @type {HTMLSelectElement} */ (document.getElementById("share-res-select")),
+  shareFpsSelect: /** @type {HTMLSelectElement} */ (document.getElementById("share-fps-select")),
+  shareAudioToggle: /** @type {HTMLInputElement} */ (document.getElementById("share-audio-toggle")),
+  shareSourceList: /** @type {HTMLElement} */ (document.getElementById("share-source-list")),
+  shareConfirmBtn: /** @type {HTMLButtonElement} */ (document.getElementById("share-confirm-btn")),
+  shareCancelBtn: /** @type {HTMLButtonElement} */ (document.getElementById("share-cancel-btn")),
 };
 
 /**
@@ -170,16 +217,24 @@ function setupWailsEvents() {
     if (!ev || !ev.name) {
       return;
     }
-    if (ev.name === "hub:state" || ev.name === "room:roster") {
+    if (ev.name === "hub:state" || ev.name === "room:roster" || ev.name === "screenshare:state") {
       if (ev.data && typeof ev.data === "object") {
         applyState(ev.data);
       }
     } else if (ev.name === "peer:stats" && Array.isArray(ev.data)) {
       state.peers = ev.data;
       ensureSelection();
+      syncScreenViewer();
       render();
     } else if (ev.name === "audio:mic-raw" && typeof ev.data === "string") {
       noiseSuppressor.pushRawMicBase64(ev.data);
+    } else if (ev.name === "screenshare:stopped") {
+      state.screenSharing = false;
+      state.screenShareState = "IDLE";
+      render();
+      void syncState();
+    } else if (ev.name === "screenshare:frame" && ev.data && typeof ev.data === "object") {
+      handleRemoteScreenFrame(ev.data);
     }
   };
 
@@ -206,6 +261,7 @@ function applyState(next) {
   const micActive = state.inCall && !state.deafened && (!state.muted || state.pushToTalk);
   void noiseSuppressor.setMode(state.noiseSuppression || "rnnoise", micActive);
   ensureSelection();
+  syncScreenViewer();
   render();
 }
 
@@ -294,6 +350,19 @@ function render() {
     el.nsBtn.className = "btn btn-primary";
   }
 
+  const ssState = state.screenShareState || "IDLE";
+  if (state.screenSharing) {
+    el.shareBtn.textContent = "[S] STOP SHARE";
+    el.shareBtn.className = "btn btn-danger";
+  } else if (ssState === "STARTING" || ssState === "STOPPING") {
+    el.shareBtn.textContent = `[S] ${ssState}...`;
+    el.shareBtn.className = "btn btn-warn";
+  } else {
+    el.shareBtn.textContent = "[S] SHARE";
+    el.shareBtn.className = "btn";
+  }
+
+  renderScreenStage();
   renderPeers();
 }
 
@@ -379,6 +448,20 @@ function renderPeers() {
 
     meta.append(pathBadge, rtt, vol);
 
+    if (peer.screenSharing) {
+      const liveTag = document.createElement("span");
+      liveTag.className = "badge-live";
+      liveTag.textContent = "[LIVE]";
+      liveTag.title = "Click or press v to view screen share";
+      liveTag.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        viewingPeerId = peer.id;
+        viewerHidden = false;
+        renderScreenStage();
+      });
+      meta.appendChild(liveTag);
+    }
+
     if (peer.localMuted || peer.remoteMuted) {
       const muteTag = document.createElement("span");
       muteTag.className = "badge-muted";
@@ -389,6 +472,252 @@ function renderPeers() {
     row.append(dot, name, meta);
     el.peerList.appendChild(row);
   }
+}
+
+function getActiveRemoteSharer() {
+  const sharingPeers = state.peers.filter((p) => p.screenSharing);
+  if (sharingPeers.length === 0) {
+    return null;
+  }
+  const byView = sharingPeers.find((p) => p.id === viewingPeerId);
+  if (byView) {
+    return byView;
+  }
+  const byBackend = sharingPeers.find((p) => p.id === state.activeScreenPeerId);
+  return byBackend || sharingPeers[0];
+}
+
+function syncScreenViewer() {
+  const sharer = getActiveRemoteSharer();
+  if (!sharer || !state.inCall) {
+    viewingPeerId = "";
+    viewerExpanded = false;
+    teardownViewerPC();
+    return;
+  }
+  if (viewingPeerId !== sharer.id) {
+    viewingPeerId = sharer.id;
+    viewerHidden = false;
+  }
+  if (!viewerPC && !viewerNegotiating && typeof RTCPeerConnection === "function") {
+    void connectViewerPC();
+  }
+}
+
+async function connectViewerPC() {
+  if (viewerNegotiating || viewerPC) {
+    return;
+  }
+  viewerNegotiating = true;
+  try {
+    const pc = new RTCPeerConnection();
+    viewerPC = pc;
+    pc.addTransceiver("video", { direction: "recvonly" });
+    pc.ontrack = (ev) => {
+      const stream = (ev.streams && ev.streams[0]) || new MediaStream([ev.track]);
+      el.remoteScreenVideo.srcObject = stream;
+      void el.remoteScreenVideo.play().catch(() => {});
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await new Promise((resolve) => {
+      if (pc.iceGatheringState === "complete") {
+        resolve(undefined);
+        return;
+      }
+      const timer = setTimeout(resolve, 350);
+      pc.addEventListener("icegatheringstatechange", () => {
+        if (pc.iceGatheringState === "complete") {
+          clearTimeout(timer);
+          resolve(undefined);
+        }
+      });
+    });
+
+    const offerSDP = pc.localDescription?.sdp || offer.sdp || "";
+    const resp = await invokeService("NegotiateScreenViewer", [offerSDP], "/screenshare/viewer", { sdp: offerSDP });
+    const answerSDP = typeof resp === "string" ? resp : resp?.sdp;
+    if (answerSDP && viewerPC === pc) {
+      await pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
+    }
+  } catch {
+    // Canvas fallback continues rendering screenshare:frame events transparently.
+  } finally {
+    viewerNegotiating = false;
+  }
+}
+
+function teardownViewerPC() {
+  if (viewerPC) {
+    try {
+      viewerPC.close();
+    } catch {
+      // Ignore close error.
+    }
+    viewerPC = null;
+  }
+  el.remoteScreenVideo.srcObject = null;
+  const ctx = el.remoteScreenCanvas.getContext("2d");
+  if (ctx) {
+    ctx.clearRect(0, 0, el.remoteScreenCanvas.width, el.remoteScreenCanvas.height);
+  }
+}
+
+/** @param {{ peerId?: string, jpeg?: string }} payload */
+function handleRemoteScreenFrame(payload) {
+  if (!payload || !payload.jpeg) {
+    return;
+  }
+  if (viewingPeerId && payload.peerId && payload.peerId !== viewingPeerId) {
+    return;
+  }
+  if (!viewingPeerId && payload.peerId) {
+    viewingPeerId = payload.peerId;
+  }
+  const img = new Image();
+  img.onload = () => {
+    const canvas = el.remoteScreenCanvas;
+    if (canvas.width !== img.width || canvas.height !== img.height) {
+      canvas.width = img.width;
+      canvas.height = img.height;
+    }
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.drawImage(img, 0, 0);
+    }
+    if (el.remoteScreenVideo.videoWidth > 0) {
+      el.remoteScreenVideo.classList.remove("hidden");
+    } else {
+      el.remoteScreenVideo.classList.add("hidden");
+    }
+  };
+  img.src = "data:image/jpeg;base64," + payload.jpeg;
+}
+
+function renderScreenStage() {
+  const sharer = getActiveRemoteSharer();
+  if (!sharer || viewerHidden || !state.inCall) {
+    el.screenStage.classList.add("hidden");
+    el.screenStage.classList.remove("expanded");
+    return;
+  }
+  el.stageTitle.textContent = `[LIVE] ${sharer.name}'s screen` + (sharer.screenAudio ? " · AUDIO" : "");
+  el.stageExpandBtn.textContent = viewerExpanded ? "[F] COMPACT" : "[F] EXPAND";
+  el.screenStage.classList.toggle("expanded", viewerExpanded);
+  el.screenStage.classList.remove("hidden");
+}
+
+async function openShareModal() {
+  if (!state.inCall) {
+    state.lastError = "Join a voice call before sharing your screen.";
+    render();
+    return;
+  }
+  shareModalOpen = true;
+  el.shareModal.classList.remove("hidden");
+  await loadShareSources();
+}
+
+function closeShareModal() {
+  shareModalOpen = false;
+  el.shareModal.classList.add("hidden");
+}
+
+async function loadShareSources() {
+  el.shareSourceList.replaceChildren();
+  const loading = document.createElement("div");
+  loading.className = "empty-hint";
+  loading.textContent = "Scanning displays & windows...";
+  el.shareSourceList.appendChild(loading);
+
+  try {
+    const sources = await invokeService("GetShareableSources", [], "/screenshare/sources");
+    shareSources = Array.isArray(sources) ? sources : [];
+    if (shareSources.length > 0 && !shareSources.some((s) => s.id === selectedSourceId)) {
+      selectedSourceId = shareSources[0].id;
+    }
+    renderShareSources();
+  } catch (err) {
+    el.shareSourceList.replaceChildren();
+    const errDiv = document.createElement("div");
+    errDiv.className = "empty-hint";
+    errDiv.textContent = err instanceof Error ? err.message : String(err);
+    el.shareSourceList.appendChild(errDiv);
+  }
+}
+
+function renderShareSources() {
+  el.shareSourceList.replaceChildren();
+  if (shareSources.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty-hint";
+    empty.textContent = "No shareable sources detected.";
+    el.shareSourceList.appendChild(empty);
+    return;
+  }
+
+  for (const src of shareSources) {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "source-card" + (src.id === selectedSourceId ? " selected" : "");
+    card.addEventListener("click", () => {
+      selectedSourceId = src.id;
+      renderShareSources();
+    });
+    card.addEventListener("dblclick", () => {
+      selectedSourceId = src.id;
+      void confirmStartShare();
+    });
+
+    if (src.thumbnail) {
+      const thumb = document.createElement("img");
+      thumb.className = "source-thumb";
+      thumb.src = src.thumbnail;
+      thumb.alt = src.title;
+      card.appendChild(thumb);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "source-meta";
+
+    const tag = document.createElement("span");
+    tag.className = "source-tag" + (src.type === "window" ? " window" : "");
+    tag.textContent = src.type === "window" ? "[WIN]" : "[SCR]";
+
+    const title = document.createElement("span");
+    title.className = "source-title";
+    title.textContent = src.title;
+    title.title = src.title;
+
+    meta.append(tag, title);
+    card.appendChild(meta);
+    el.shareSourceList.appendChild(card);
+  }
+}
+
+function moveSourceSelection(delta) {
+  if (shareSources.length === 0) {
+    return;
+  }
+  const idx = shareSources.findIndex((s) => s.id === selectedSourceId);
+  const nextIdx = idx < 0 ? 0 : Math.max(0, Math.min(shareSources.length - 1, idx + delta));
+  selectedSourceId = shareSources[nextIdx].id;
+  renderShareSources();
+}
+
+async function confirmStartShare() {
+  if (!selectedSourceId) {
+    return;
+  }
+  const cfg = {
+    sourceId: selectedSourceId,
+    resolution: el.shareResSelect.value || "720p",
+    fps: Number(el.shareFpsSelect.value || 30),
+    includeSystemAudio: Boolean(el.shareAudioToggle.checked),
+  };
+  closeShareModal();
+  await runAction(() => invokeService("StartScreenShare", [cfg], "/screenshare/start", cfg));
 }
 
 function openHubEditor() {
@@ -471,10 +800,70 @@ function wireControls() {
     void runAction(() => invokeService("CycleNoiseSuppression", [], "/mic/ns"));
   });
 
+  el.shareBtn.addEventListener("click", () => {
+    if (state.screenSharing) {
+      void runAction(() => invokeService("StopScreenShare", [], "/screenshare/stop"));
+    } else {
+      void openShareModal();
+    }
+  });
+
+  el.shareRefreshBtn.addEventListener("click", () => {
+    void loadShareSources();
+  });
+
+  el.shareCancelBtn.addEventListener("click", closeShareModal);
+
+  el.shareConfirmBtn.addEventListener("click", () => {
+    void confirmStartShare();
+  });
+
+  el.stageExpandBtn.addEventListener("click", () => {
+    viewerExpanded = !viewerExpanded;
+    renderScreenStage();
+  });
+
+  el.stageHideBtn.addEventListener("click", () => {
+    viewerHidden = !viewerHidden;
+    viewerExpanded = false;
+    renderScreenStage();
+  });
+
   window.addEventListener("keydown", (e) => {
     if (e.ctrlKey && e.key.toLowerCase() === "q") {
       e.preventDefault();
       void quitApplication();
+      return;
+    }
+
+    if (shareModalOpen) {
+      switch (e.key) {
+        case "Escape":
+          e.preventDefault();
+          closeShareModal();
+          break;
+        case "Enter":
+          e.preventDefault();
+          void confirmStartShare();
+          break;
+        case "j":
+        case "ArrowDown":
+        case "ArrowRight":
+          e.preventDefault();
+          moveSourceSelection(1);
+          break;
+        case "k":
+        case "ArrowUp":
+        case "ArrowLeft":
+          e.preventDefault();
+          moveSourceSelection(-1);
+          break;
+        case "r":
+        case "R":
+          e.preventDefault();
+          void loadShareSources();
+          break;
+      }
       return;
     }
 
@@ -487,7 +876,7 @@ function wireControls() {
     }
 
     const activeTag = document.activeElement?.tagName;
-    if (activeTag === "INPUT" || activeTag === "TEXTAREA") {
+    if (activeTag === "INPUT" || activeTag === "TEXTAREA" || activeTag === "SELECT") {
       return;
     }
 
@@ -519,6 +908,34 @@ function wireControls() {
       case "N":
         e.preventDefault();
         void runAction(() => invokeService("CycleNoiseSuppression", [], "/mic/ns"));
+        break;
+      case "s":
+      case "S":
+        e.preventDefault();
+        if (state.screenSharing) {
+          void runAction(() => invokeService("StopScreenShare", [], "/screenshare/stop"));
+        } else {
+          void openShareModal();
+        }
+        break;
+      case "v":
+      case "V":
+        e.preventDefault();
+        if (getActiveRemoteSharer()) {
+          viewerHidden = !viewerHidden;
+          if (viewerHidden) {
+            viewerExpanded = false;
+          }
+          renderScreenStage();
+        }
+        break;
+      case "f":
+      case "F":
+        e.preventDefault();
+        if (getActiveRemoteSharer() && !viewerHidden) {
+          viewerExpanded = !viewerExpanded;
+          renderScreenStage();
+        }
         break;
       case "j":
       case "ArrowDown":
@@ -555,7 +972,10 @@ function wireControls() {
         break;
       case "Escape":
         e.preventDefault();
-        if (state.inCall) {
+        if (viewerExpanded) {
+          viewerExpanded = false;
+          renderScreenStage();
+        } else if (state.inCall) {
           void runAction(() => invokeService("LeaveCall", [], "/call/leave"));
         }
         break;

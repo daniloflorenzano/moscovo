@@ -14,17 +14,25 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/pion/webrtc/v4/pkg/media"
 
 	"moscovo/internal/audio"
 	"moscovo/internal/domain"
+	"moscovo/internal/screenshare/capture"
+	"moscovo/internal/screenshare/encoder"
 	"moscovo/internal/transport"
 )
 
 const (
-	EventHubState  = "hub:state"
-	EventRoomState = "room:roster"
-	EventPeerStats = "peer:stats"
-	EventMicRaw    = "audio:mic-raw"
+	EventHubState           = "hub:state"
+	EventRoomState          = "room:roster"
+	EventPeerStats          = "peer:stats"
+	EventMicRaw             = "audio:mic-raw"
+	EventScreenShareStopped = "screenshare:stopped"
+	EventScreenShareState   = "screenshare:state"
+	EventScreenShareFrame   = "screenshare:frame"
 
 	defaultHubAddr = "127.0.0.1:7878"
 )
@@ -45,43 +53,57 @@ type ServiceConfig struct {
 
 // AppState is the single-screen state snapshot exposed to the Wails frontend.
 type AppState struct {
-	HubAddr          string                      `json:"hubAddr"`
-	LocalID          string                      `json:"localId"`
-	Nickname         string                      `json:"nickname"`
-	HubStatus        string                      `json:"hubStatus"`
-	MicDevice        string                      `json:"micDevice"`
-	OutputDevice     string                      `json:"outputDevice"`
-	InCall           bool                        `json:"inCall"`
-	Muted            bool                        `json:"muted"`
-	Deafened         bool                        `json:"deafened"`
-	PushToTalk       bool                        `json:"pushToTalk"`
-	Speaking         bool                        `json:"speaking"`
-	NoiseSuppression domain.NoiseSuppressionMode `json:"noiseSuppression"`
-	LastError        string                      `json:"lastError,omitempty"`
-	Peers            []domain.PeerSession        `json:"peers"`
+	HubAddr            string                      `json:"hubAddr"`
+	LocalID            string                      `json:"localId"`
+	Nickname           string                      `json:"nickname"`
+	HubStatus          string                      `json:"hubStatus"`
+	MicDevice          string                      `json:"micDevice"`
+	OutputDevice       string                      `json:"outputDevice"`
+	InCall             bool                        `json:"inCall"`
+	Muted              bool                        `json:"muted"`
+	Deafened           bool                        `json:"deafened"`
+	PushToTalk         bool                        `json:"pushToTalk"`
+	Speaking           bool                        `json:"speaking"`
+	NoiseSuppression   domain.NoiseSuppressionMode `json:"noiseSuppression"`
+	ScreenShareState   string                      `json:"screenShareState"`
+	ScreenSharing      bool                        `json:"screenSharing"`
+	ScreenShareConfig  *domain.ScreenShareConfig   `json:"screenShareConfig,omitempty"`
+	ActiveScreenPeerID string                      `json:"activeScreenPeerId,omitempty"`
+	IsWayland          bool                        `json:"isWayland"`
+	LastError          string                      `json:"lastError,omitempty"`
+	Peers              []domain.PeerSession        `json:"peers"`
 }
 
-// VoiceService coordinates the Hub signaling client, WebRTC mesh, and audio engine for the UI.
+// VoiceService coordinates the Hub signaling client, WebRTC mesh, audio engine, and screen share for the UI.
 type VoiceService struct {
-	mu               sync.Mutex
-	hubAddr          string
-	localID          string
-	nickname         string
-	hubConnState     transport.HubConnectionState
-	micDevice        string
-	outputDevice     string
-	inCall           bool
-	muted            bool
-	deafened         bool
-	pushToTalk       bool
-	noiseSuppression domain.NoiseSuppressionMode
-	lastError        string
-	peers            []domain.PeerSession
-	stunServers      []string
-	forceRelay       bool
-	includeLoopback  bool
-	emit             EventEmitter
-	logger           *slog.Logger
+	mu                 sync.Mutex
+	hubAddr            string
+	localID            string
+	nickname           string
+	hubConnState       transport.HubConnectionState
+	micDevice          string
+	outputDevice       string
+	inCall             bool
+	muted              bool
+	deafened           bool
+	pushToTalk         bool
+	noiseSuppression   domain.NoiseSuppressionMode
+	lastError          string
+	peers              []domain.PeerSession
+	stunServers        []string
+	forceRelay         bool
+	includeLoopback    bool
+	emit               EventEmitter
+	logger             *slog.Logger
+	screenLifecycle    *domain.ScreenShareLifecycle
+	screenConfig       *domain.ScreenShareConfig
+	screenPool         *encoder.FramePool
+	screenPipe         *capture.Pipeline
+	activeScreenPeerID string
+	lastSources        []domain.ShareableSource
+	capturerFactory    func(capture.CaptureConfig, *encoder.FramePool) (capture.Capturer, error)
+	sourcesFetcher     func(context.Context) ([]domain.ShareableSource, error)
+	disableFFmpeg      bool
 
 	callCancel context.CancelFunc
 	callWG     *sync.WaitGroup
@@ -124,6 +146,9 @@ func NewVoiceService(cfg ServiceConfig) *VoiceService {
 		emit:             cfg.Emit,
 		logger:           logger,
 		peers:            []domain.PeerSession{},
+		screenLifecycle:  domain.NewScreenShareLifecycle(),
+		capturerFactory:  capture.NewPlatformCapturer,
+		sourcesFetcher:   capture.GetShareableSources,
 	}
 }
 
@@ -276,6 +301,33 @@ func (s *VoiceService) JoinCall() (AppState, error) {
 		OnSessionsChange: func(sessions []domain.PeerSession) {
 			s.handleSessionsChanged(sessions)
 		},
+		OnRemoteScreenFrame: func(peerID string, jpegData []byte, w, h int) {
+			s.emitState(EventScreenShareFrame, map[string]any{
+				"peerId": peerID,
+				"jpeg":   base64.StdEncoding.EncodeToString(jpegData),
+				"width":  w,
+				"height": h,
+			})
+		},
+		OnRemoteScreenState: func(peerID string, active bool, hasAudio bool) {
+			s.handleRemoteScreenState(peerID, active, hasAudio)
+		},
+		OnScreenBitrateChange: func(rembBps uint64, lossFraction float64, rttMs int) {
+			s.mu.Lock()
+			pipe := s.screenPipe
+			s.mu.Unlock()
+			if pipe != nil {
+				pipe.ApplyFeedback(rembBps, lossFraction, rttMs)
+			}
+		},
+		OnScreenKeyframeRequest: func() {
+			s.mu.Lock()
+			pipe := s.screenPipe
+			s.mu.Unlock()
+			if pipe != nil {
+				pipe.RequestKeyFrame()
+			}
+		},
 	})
 	if err != nil {
 		_ = eng.Close()
@@ -323,8 +375,10 @@ func (s *VoiceService) JoinCall() (AppState, error) {
 	return state, nil
 }
 
-// LeaveCall exits the voice room, closes PeerConnections, and stops audio pipelines cleanly.
+// LeaveCall exits the voice room, closes PeerConnections, and stops audio and screen-share pipelines cleanly.
 func (s *VoiceService) LeaveCall() (AppState, error) {
+	_, _ = s.StopScreenShare()
+
 	s.mu.Lock()
 	if !s.inCall {
 		state := s.snapshotLocked()
@@ -340,6 +394,7 @@ func (s *VoiceService) LeaveCall() (AppState, error) {
 	s.inCall = false
 	s.hubConnState = transport.HubOffline
 	s.peers = []domain.PeerSession{}
+	s.activeScreenPeerID = ""
 	s.callCancel = nil
 	s.callWG = nil
 	s.hubClient = nil
@@ -510,6 +565,228 @@ func (s *VoiceService) TogglePeerMute(peerID string) (AppState, error) {
 	return s.GetState(), nil
 }
 
+// GetShareableSources enumerates monitors, windows, or the Wayland ScreenCast portal (FR-01, FR-02).
+func (s *VoiceService) GetShareableSources() ([]domain.ShareableSource, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	s.mu.Lock()
+	fetcher := s.sourcesFetcher
+	s.mu.Unlock()
+	if fetcher == nil {
+		fetcher = capture.GetShareableSources
+	}
+
+	sources, err := fetcher(ctx)
+	if err != nil {
+		s.setError(err.Error())
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.lastSources = append([]domain.ShareableSource(nil), sources...)
+	s.mu.Unlock()
+	return sources, nil
+}
+
+// StartScreenShare initializes capture, encoding, and dynamic WebRTC screen-share tracks (FR-02..FR-06, NFR-06).
+func (s *VoiceService) StartScreenShare(cfg domain.ScreenShareConfig) (AppState, error) {
+	norm, err := cfg.Normalized()
+	if err != nil {
+		s.setError(err.Error())
+		return s.GetState(), err
+	}
+
+	if err := s.screenLifecycle.TryStart(); err != nil {
+		return s.GetState(), err
+	}
+
+	s.mu.Lock()
+	inCall := s.inCall
+	mesh := s.mesh
+	sources := append([]domain.ShareableSource(nil), s.lastSources...)
+	capFactory := s.capturerFactory
+	disableFFmpeg := s.disableFFmpeg
+	s.mu.Unlock()
+
+	if !inCall || mesh == nil {
+		s.screenLifecycle.ResetIdle()
+		err := errors.New("join a voice call before sharing screen")
+		s.setError(err.Error())
+		return s.GetState(), err
+	}
+	if capFactory == nil {
+		capFactory = capture.NewPlatformCapturer
+	}
+
+	srcW, srcH := 1920, 1080
+	for _, src := range sources {
+		if src.ID == norm.SourceID && src.Width > 0 && src.Height > 0 {
+			srcW, srcH = src.Width, src.Height
+			break
+		}
+	}
+	dstW, dstH := domain.ResolveTargetDimensions(srcW, srcH, norm.Resolution)
+
+	pool := encoder.NewFramePool()
+	vidEnc, err := encoder.NewVideoEncoder(encoder.EncoderConfig{
+		Width:          dstW,
+		Height:         dstH,
+		FPS:            norm.FPS,
+		BitrateBps:     domain.DefaultVideoBitrateBps,
+		PreferHardware: true,
+		DisableFFmpeg:  disableFFmpeg,
+	})
+	if err != nil {
+		s.screenLifecycle.ResetIdle()
+		s.setError(err.Error())
+		return s.GetState(), err
+	}
+
+	var audEnc *encoder.SystemAudioEncoder
+	if norm.IncludeSystemAudio {
+		audEnc = encoder.NewSystemAudioEncoder(encoder.SystemAudioCaptureRate, encoder.SystemAudioCaptureChannels)
+	}
+
+	capturer, err := capFactory(capture.CaptureConfig{
+		SourceID:           norm.SourceID,
+		Resolution:         norm.Resolution,
+		FPS:                norm.FPS,
+		IncludeSystemAudio: norm.IncludeSystemAudio,
+		TargetWidth:        dstW,
+		TargetHeight:       dstH,
+	}, pool)
+	if err != nil {
+		_ = vidEnc.Close()
+		if audEnc != nil {
+			_ = audEnc.Close()
+		}
+		s.screenLifecycle.ResetIdle()
+		s.setError(err.Error())
+		return s.GetState(), err
+	}
+
+	pipe, err := capture.NewPipeline(capture.PipelineConfig{
+		Capturer:     capturer,
+		Encoder:      vidEnc,
+		AudioEncoder: audEnc,
+		Pool:         pool,
+		TargetWidth:  dstW,
+		TargetHeight: dstH,
+		OnVideoSample: func(f encoder.EncodedFrame) {
+			_ = mesh.WriteScreenVideoSample(media.Sample{
+				Data:     f.Data,
+				Duration: f.Duration,
+			})
+		},
+		OnAudioSample: func(data []byte, dur time.Duration) {
+			_ = mesh.WriteScreenAudioSample(media.Sample{
+				Data:     data,
+				Duration: dur,
+			})
+		},
+		OnStopped: func(reason error) {
+			s.stopScreenShareInternal(reason)
+		},
+	})
+	if err != nil {
+		_ = capturer.Close()
+		_ = vidEnc.Close()
+		if audEnc != nil {
+			_ = audEnc.Close()
+		}
+		s.screenLifecycle.ResetIdle()
+		s.setError(err.Error())
+		return s.GetState(), err
+	}
+
+	if err := mesh.StartScreenShareTracks(vidEnc.CodecMime(), norm.IncludeSystemAudio); err != nil {
+		_ = pipe.Stop()
+		s.screenLifecycle.ResetIdle()
+		s.setError(err.Error())
+		return s.GetState(), err
+	}
+
+	if err := pipe.Start(context.Background()); err != nil {
+		_ = pipe.Stop()
+		_ = mesh.StopScreenShareTracks()
+		s.screenLifecycle.ResetIdle()
+		s.setError(err.Error())
+		return s.GetState(), err
+	}
+
+	if err := s.screenLifecycle.MarkStreaming(); err != nil {
+		// Concurrent stop arrived while starting.
+		_ = pipe.Stop()
+		_ = mesh.StopScreenShareTracks()
+		s.screenLifecycle.ResetIdle()
+		return s.GetState(), err
+	}
+
+	s.mu.Lock()
+	s.screenPool = pool
+	s.screenPipe = pipe
+	cfgCopy := norm
+	s.screenConfig = &cfgCopy
+	s.lastError = ""
+	state := s.snapshotLocked()
+	s.mu.Unlock()
+
+	s.emitState(EventScreenShareState, state)
+	s.emitState(EventHubState, state)
+	return state, nil
+}
+
+// StopScreenShare terminates local screen sharing, removes WebRTC tracks, and emits screenshare:stopped (FR-05).
+func (s *VoiceService) StopScreenShare() (AppState, error) {
+	s.stopScreenShareInternal(nil)
+	return s.GetState(), nil
+}
+
+func (s *VoiceService) stopScreenShareInternal(reason error) {
+	if err := s.screenLifecycle.BeginStop(); err != nil {
+		return
+	}
+
+	s.mu.Lock()
+	pipe := s.screenPipe
+	mesh := s.mesh
+	s.screenPipe = nil
+	s.screenPool = nil
+	s.screenConfig = nil
+	s.mu.Unlock()
+
+	if pipe != nil {
+		_ = pipe.Stop()
+	}
+	if mesh != nil {
+		_ = mesh.StopScreenShareTracks()
+	}
+	s.screenLifecycle.ResetIdle()
+
+	reasonText := ""
+	if reason != nil {
+		reasonText = reason.Error()
+	}
+	state := s.GetState()
+	s.emitState(EventScreenShareStopped, map[string]any{
+		"reason": reasonText,
+	})
+	s.emitState(EventScreenShareState, state)
+	s.emitState(EventHubState, state)
+}
+
+// NegotiateScreenViewer exchanges SDP with the frontend RTCPeerConnection for remote video ontrack delivery.
+func (s *VoiceService) NegotiateScreenViewer(offerSDP string) (string, error) {
+	s.mu.Lock()
+	mesh := s.mesh
+	s.mu.Unlock()
+	if mesh == nil {
+		return "", errors.New("not in a call")
+	}
+	return mesh.NegotiateViewerSDP(offerSDP)
+}
+
 // Shutdown cleanly exits any active call before application termination.
 func (s *VoiceService) Shutdown() error {
 	_, err := s.LeaveCall()
@@ -631,6 +908,42 @@ func (s *VoiceService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		state, err := s.TogglePeerMute(req.PeerID)
 		writeStateResponse(w, state, err)
 
+	case r.Method == http.MethodGet && path == "/screenshare/sources":
+		sources, err := s.GetShareableSources()
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, sources)
+
+	case r.Method == http.MethodPost && path == "/screenshare/start":
+		var req domain.ScreenShareConfig
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		state, err := s.StartScreenShare(req)
+		writeStateResponse(w, state, err)
+
+	case r.Method == http.MethodPost && path == "/screenshare/stop":
+		state, err := s.StopScreenShare()
+		writeStateResponse(w, state, err)
+
+	case r.Method == http.MethodPost && path == "/screenshare/viewer":
+		var req struct {
+			SDP string `json:"sdp"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		answerSDP, err := s.NegotiateScreenViewer(req.SDP)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"sdp": answerSDP})
+
 	default:
 		http.NotFound(w, r)
 	}
@@ -682,11 +995,48 @@ func (s *VoiceService) handleSessionsChanged(sessions []domain.PeerSession) {
 		return
 	}
 	s.peers = append([]domain.PeerSession(nil), sessions...)
+	s.reconcileActiveScreenPeerLocked()
 	state := s.snapshotLocked()
 	s.mu.Unlock()
 
 	s.emitState(EventRoomState, state)
 	s.emitState(EventPeerStats, state.Peers)
+}
+
+func (s *VoiceService) handleRemoteScreenState(peerID string, active bool, _ bool) {
+	s.mu.Lock()
+	if !s.inCall {
+		s.mu.Unlock()
+		return
+	}
+	if active {
+		s.activeScreenPeerID = peerID
+	} else if s.activeScreenPeerID == peerID {
+		s.activeScreenPeerID = ""
+		s.reconcileActiveScreenPeerLocked()
+	}
+	state := s.snapshotLocked()
+	s.mu.Unlock()
+
+	s.emitState(EventScreenShareState, state)
+	s.emitState(EventHubState, state)
+}
+
+func (s *VoiceService) reconcileActiveScreenPeerLocked() {
+	if s.activeScreenPeerID != "" {
+		for _, p := range s.peers {
+			if p.ID == s.activeScreenPeerID && p.ScreenSharing {
+				return
+			}
+		}
+		s.activeScreenPeerID = ""
+	}
+	for _, p := range s.peers {
+		if p.ScreenSharing {
+			s.activeScreenPeerID = p.ID
+			return
+		}
+	}
 }
 
 func (s *VoiceService) setError(msg string) {
@@ -725,21 +1075,32 @@ func (s *VoiceService) snapshotLocked() AppState {
 		speaking = s.audioEng.Speaking()
 	}
 	peersCopy := append([]domain.PeerSession(nil), s.peers...)
+	screenState := s.screenLifecycle.State()
+	var cfgCopy *domain.ScreenShareConfig
+	if s.screenConfig != nil {
+		c := *s.screenConfig
+		cfgCopy = &c
+	}
 	return AppState{
-		HubAddr:          s.hubAddr,
-		LocalID:          s.localID,
-		Nickname:         s.nickname,
-		HubStatus:        status,
-		MicDevice:        s.micDevice,
-		OutputDevice:     s.outputDevice,
-		InCall:           s.inCall,
-		Muted:            s.muted,
-		Deafened:         s.deafened,
-		PushToTalk:       s.pushToTalk,
-		Speaking:         speaking,
-		NoiseSuppression: s.noiseSuppression,
-		LastError:        s.lastError,
-		Peers:            peersCopy,
+		HubAddr:            s.hubAddr,
+		LocalID:            s.localID,
+		Nickname:           s.nickname,
+		HubStatus:          status,
+		MicDevice:          s.micDevice,
+		OutputDevice:       s.outputDevice,
+		InCall:             s.inCall,
+		Muted:              s.muted,
+		Deafened:           s.deafened,
+		PushToTalk:         s.pushToTalk,
+		Speaking:           speaking,
+		NoiseSuppression:   s.noiseSuppression,
+		ScreenShareState:   string(screenState),
+		ScreenSharing:      screenState == domain.ScreenShareStreaming,
+		ScreenShareConfig:  cfgCopy,
+		ActiveScreenPeerID: s.activeScreenPeerID,
+		IsWayland:          capture.IsWaylandSession(),
+		LastError:          s.lastError,
+		Peers:              peersCopy,
 	}
 }
 

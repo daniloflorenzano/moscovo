@@ -1,16 +1,25 @@
 package transport
 
 import (
+	"bytes"
 	"context"
+	"image"
+	"image/color"
 	"net/http/httptest"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 
 	"moscovo/internal/audio"
 	"moscovo/internal/domain"
 	"moscovo/internal/hub"
+	"moscovo/internal/screenshare/encoder"
 )
 
 type testPeerNode struct {
@@ -257,4 +266,173 @@ func TestPeerLeaveRecoveryAndCleanShutdown(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Logf("goroutines before=%d after=%d", baseGoroutines, runtime.NumGoroutine())
+}
+
+func TestScreenShareDynamicTrackRenegotiationAndTeardown(t *testing.T) {
+	_, _, hubURL := startTestHub(t)
+
+	alice := startTestPeer(t, hubURL, "peer-a", "alice", false)
+	bob := startTestPeer(t, hubURL, "peer-b", "bob", false)
+
+	var (
+		frameMu    sync.Mutex
+		framesSeen int
+		lastJPEG   []byte
+	)
+	var stateActive atomic.Bool
+	alice.mesh.mu.Lock()
+	alice.mesh.onRemoteScreenFrame = func(peerID string, jpegData []byte, w, h int) {
+		if peerID != "peer-b" || len(jpegData) == 0 {
+			return
+		}
+		frameMu.Lock()
+		framesSeen++
+		lastJPEG = append([]byte(nil), jpegData...)
+		frameMu.Unlock()
+	}
+	alice.mesh.onRemoteScreenState = func(peerID string, active bool, _ bool) {
+		if peerID == "peer-b" {
+			stateActive.Store(active)
+		}
+	}
+	alice.mesh.mu.Unlock()
+
+	waitUntil(t, 10*time.Second, "voice call established before screen share", func() bool {
+		as := alice.mesh.Sessions()
+		if len(as) != 1 || as[0].State != domain.StateConnectedP2P {
+			return false
+		}
+		stats, ok := alice.audio.PeerStats("peer-b")
+		return ok && stats.PacketsReceived > 0
+	})
+
+	// Bob (higher ID, polite peer) starts screen sharing with isolated system audio (FR-04, FR-06).
+	if err := bob.mesh.StartScreenShareTracks(webrtc.MimeTypeVP8, true); err != nil {
+		t.Fatalf("bob.mesh.StartScreenShareTracks() failed: %v", err)
+	}
+
+	pool := encoder.NewFramePool()
+	vidEnc, err := encoder.NewVideoEncoder(encoder.EncoderConfig{
+		Width:         320,
+		Height:        180,
+		FPS:           15,
+		BitrateBps:    1_000_000,
+		DisableFFmpeg: true,
+	})
+	if err != nil {
+		t.Fatalf("NewVideoEncoder() failed: %v", err)
+	}
+	defer func() { _ = vidEnc.Close() }()
+
+	img := image.NewRGBA(image.Rect(0, 0, 320, 180))
+	for y := 0; y < 180; y++ {
+		for x := 0; x < 320; x++ {
+			img.SetRGBA(x, y, color.RGBA{R: 94, G: 194, B: 242, A: 255})
+		}
+	}
+	yuv := encoder.ConvertRGBAToYUV420(img, 320, 180, pool)
+	defer pool.PutYUV420(yuv)
+
+	stopFeed := make(chan struct{})
+	var feedWG sync.WaitGroup
+	feedWG.Add(1)
+	go func() {
+		defer feedWG.Done()
+		ticker := time.NewTicker(40 * time.Millisecond)
+		defer ticker.Stop()
+		sysAudio := make([]byte, 640)
+		for i := 0; i < len(sysAudio); i += 2 {
+			sysAudio[i] = 0x10
+			sysAudio[i+1] = 0x04
+		}
+		for {
+			select {
+			case <-stopFeed:
+				return
+			case <-ticker.C:
+				f, encErr := vidEnc.Encode(yuv, false)
+				if encErr == nil {
+					_ = bob.mesh.WriteScreenVideoSample(media.Sample{
+						Data:     f.Data,
+						Duration: f.Duration,
+					})
+				}
+				_ = bob.mesh.WriteScreenAudioSample(media.Sample{
+					Data:     sysAudio,
+					Duration: audio.DefaultFrameDuration,
+				})
+			}
+		}
+	}()
+
+	waitUntil(t, 8*time.Second, "alice receives renegotiated screen share video and isolated system audio", func() bool {
+		frameMu.Lock()
+		nFrames := framesSeen
+		jpg := lastJPEG
+		frameMu.Unlock()
+		if nFrames == 0 || !bytes.HasPrefix(jpg, []byte{0xFF, 0xD8}) {
+			return false
+		}
+		if !stateActive.Load() {
+			return false
+		}
+		screenAudioStats, ok := alice.audio.PeerStats("screen:peer-b")
+		if !ok || screenAudioStats.PacketsReceived == 0 {
+			return false
+		}
+		for _, s := range alice.mesh.Sessions() {
+			if s.ID == "peer-b" && s.ScreenSharing {
+				return true
+			}
+		}
+		return false
+	})
+
+	// Verify frontend viewer PeerConnection bridge produces a valid video answer SDP.
+	viewerPC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("NewPeerConnection(viewer) failed: %v", err)
+	}
+	defer func() { _ = viewerPC.Close() }()
+	if _, err := viewerPC.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	}); err != nil {
+		t.Fatalf("AddTransceiverFromKind(video) failed: %v", err)
+	}
+	viewerOffer, err := viewerPC.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("viewerPC.CreateOffer() failed: %v", err)
+	}
+	if err := viewerPC.SetLocalDescription(viewerOffer); err != nil {
+		t.Fatalf("viewerPC.SetLocalDescription() failed: %v", err)
+	}
+	viewerAnswerSDP, err := alice.mesh.NegotiateViewerSDP(viewerOffer.SDP)
+	if err != nil {
+		t.Fatalf("alice.mesh.NegotiateViewerSDP() failed: %v", err)
+	}
+	if !strings.Contains(viewerAnswerSDP, "m=video") {
+		t.Fatalf("viewer answer SDP missing m=video section")
+	}
+
+	// Verify ongoing voice packets keep flowing while screen share tears down cleanly (FR-05).
+	beforeVoice, _ := alice.audio.PeerStats("peer-b")
+	close(stopFeed)
+	feedWG.Wait()
+
+	if err := bob.mesh.StopScreenShareTracks(); err != nil {
+		t.Fatalf("bob.mesh.StopScreenShareTracks() failed: %v", err)
+	}
+
+	waitUntil(t, 6*time.Second, "alice observes screen share stopped while voice call continues", func() bool {
+		if stateActive.Load() {
+			return false
+		}
+		for _, s := range alice.mesh.Sessions() {
+			if s.ID == "peer-b" && !s.ScreenSharing {
+				afterVoice, ok := alice.audio.PeerStats("peer-b")
+				return ok && afterVoice.PacketsReceived > beforeVoice.PacketsReceived
+			}
+		}
+		return false
+	})
 }

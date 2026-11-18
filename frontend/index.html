@@ -44,6 +44,20 @@
       </div>
     </section>
 
+    <section class="screen-stage hidden" id="screen-stage" aria-label="Remote Screen Share">
+      <div class="stage-bar">
+        <span class="stage-title" id="stage-title">[LIVE] Screen</span>
+        <div class="stage-actions">
+          <button type="button" class="btn btn-mini" id="stage-expand-btn">[F] EXPAND</button>
+          <button type="button" class="btn btn-mini" id="stage-hide-btn">[V] HIDE</button>
+        </div>
+      </div>
+      <div class="stage-viewport">
+        <canvas id="remote-screen-canvas"></canvas>
+        <video id="remote-screen-video" autoplay playsinline muted></video>
+      </div>
+    </section>
+
     <section class="room-section" aria-label="Voice Room">
       <div class="section-title">
         <span>VOICE ROOM</span>
@@ -58,11 +72,48 @@
         <button type="button" class="btn" id="mute-btn">[M] MIC: ON</button>
         <button type="button" class="btn" id="deafen-btn">[D] DEAFEN</button>
         <button type="button" class="btn btn-primary" id="ns-btn">[N] NS: RNNOISE</button>
+        <button type="button" class="btn" id="share-btn">[S] SHARE</button>
       </div>
       <div class="hint-row">
-        Space PTT · n noise · j/k select · h/l vol · x mute · / hub · Esc leave
+        Space PTT · s share · v view · n noise · j/k select · h/l vol · x mute · / hub · Esc leave
       </div>
     </footer>
+
+    <div class="share-modal hidden" id="share-modal" role="dialog" aria-modal="true" aria-label="Select Screen or Window">
+      <div class="share-dialog">
+        <div class="share-header">
+          <span>SHARE SCREEN</span>
+          <button type="button" class="btn btn-mini" id="share-refresh-btn">[R] REFRESH</button>
+        </div>
+        <div class="share-config-row">
+          <label class="cfg-pill">
+            <span>RES</span>
+            <select id="share-res-select">
+              <option value="720p">720p</option>
+              <option value="1080p">1080p</option>
+              <option value="native">Native</option>
+            </select>
+          </label>
+          <label class="cfg-pill">
+            <span>FPS</span>
+            <select id="share-fps-select">
+              <option value="15">15</option>
+              <option value="30" selected>30</option>
+              <option value="60">60</option>
+            </select>
+          </label>
+          <label class="cfg-toggle">
+            <input type="checkbox" id="share-audio-toggle" />
+            <span>SYS AUDIO</span>
+          </label>
+        </div>
+        <div class="share-source-list" id="share-source-list"></div>
+        <div class="share-actions">
+          <button type="button" class="btn btn-primary" id="share-confirm-btn">[ENTER] START SHARE</button>
+          <button type="button" class="btn" id="share-cancel-btn">[ESC] CANCEL</button>
+        </div>
+      </div>
+    </div>
   </main>
 
   <script type="module" src="/src/main.ts"></script>
